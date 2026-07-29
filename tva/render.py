@@ -85,11 +85,13 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
     wt = ws.load("world_tracks.json")
     v_stop, v_move = wt["v_stop"], wt["v_move"]
     car_len = wt["car_len_px"]
-    roads = []
-    if "roads" in layers:
-        try:
-            roads = ws.load("roads.json")["roads"]
-        except FileNotFoundError:
+    # roads.json is loaded even when the layer is off: parked culling needs it
+    roads_draw = "roads" in layers
+    try:
+        roads = ws.load("roads.json")["roads"]
+    except FileNotFoundError:
+        roads = []
+        if roads_draw:
             print("roads.json missing - run `tva roads` first; skipping layer")
 
     # per-track median bbox size (frame px) for marker radius, and observed
@@ -102,9 +104,25 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
                                              for o in tr["obs"]]))
         px_of[tr["id"]] = {o[0]: (o[1], o[2]) for o in tr["obs"]}
 
+    # statics.json: hand-enforced known-fixed zones (parking lots, depots) in
+    # world px. Registration extrapolation drifts in off-plane corners, so
+    # parked cars there read fake speeds no automatic static test catches.
+    parked = set()
+    try:
+        zones = ws.load("statics.json")["zones"]
+    except FileNotFoundError:
+        zones = []
+    if zones:
+        from matplotlib.path import Path
+        paths = [Path(z["polygon"]) for z in zones]
+        for tr in wt["tracks"]:
+            p = (np.median(tr["x"]), np.median(tr["y"]))
+            if any(pt.contains_point(p) for pt in paths):
+                parked.add(tr["id"])
+        print(f"{len(parked)} vehicles inside static zones hidden")
+
     # parked = static AND off every inferred road: don't paint them at all
     # (their "speed" is pure registration noise, so they twitch with color)
-    parked = set()
     if roads:
         from .kinematics import station_of
         for tr in wt["tracks"]:
@@ -153,7 +171,7 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
         if not ok:
             break
         layer = frame.copy()
-        if roads:
+        if roads_draw and roads:
             draw_roads(layer, roads, Hinv[i])
         for tr, k in per_frame[i] if "cars" in layers else []:
             k0 = int(k)

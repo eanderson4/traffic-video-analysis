@@ -38,6 +38,9 @@ def main():
     p.add_argument("--model", default="yolo11m.pt")
     p.add_argument("--imgsz", type=int, default=3840)
     p.add_argument("--conf", type=float, default=0.25)
+    p.add_argument("--max-det", type=int, default=900,
+                   help="per-frame detection cap (ultralytics default 300 "
+                        "saturates on dense scenes at full imgsz)")
 
     args = ap.parse_args()
     if args.cmd == "init":
@@ -54,7 +57,8 @@ def main():
         stabilize.qa(ws)
     elif args.cmd == "detect":
         from . import detect
-        detect.run(ws, model=args.model, imgsz=args.imgsz, conf=args.conf)
+        detect.run(ws, model=args.model, imgsz=args.imgsz, conf=args.conf,
+                   max_det=args.max_det)
         detect.qa(ws)
     elif args.cmd == "world":
         from . import kinematics

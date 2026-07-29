@@ -13,7 +13,7 @@ from collections import defaultdict
 VEHICLE_NAMES = {"car", "van", "truck", "bus", "motorcycle", "motor"}
 
 
-def run(ws, model="yolo11m.pt", imgsz=3840, conf=0.25):
+def run(ws, model="yolo11m.pt", imgsz=3840, conf=0.25, max_det=900):
     from ultralytics import YOLO
 
     meta = ws.meta
@@ -24,7 +24,7 @@ def run(ws, model="yolo11m.pt", imgsz=3840, conf=0.25):
     tracks = defaultdict(lambda: {"cls": None, "obs": []})
     n = 0
     for i, r in enumerate(yolo.track(
-            source=meta["src"], imgsz=imgsz, conf=conf,
+            source=meta["src"], imgsz=imgsz, conf=conf, max_det=max_det,
             classes=class_ids, tracker="bytetrack.yaml",
             stream=True, verbose=False)):
         b = r.boxes
@@ -43,7 +43,7 @@ def run(ws, model="yolo11m.pt", imgsz=3840, conf=0.25):
             print(f"frame {i}: {len(tracks)} tracks, {n} obs total",
                   flush=True)
     ws.save("tracks.json", {
-        "model": model, "imgsz": imgsz, "conf": conf,
+        "model": model, "imgsz": imgsz, "conf": conf, "max_det": max_det,
         "tracks": [{"id": tid, **tr} for tid, tr in sorted(tracks.items())],
     })
     print(f"{len(tracks)} tracks, {n} observations")
