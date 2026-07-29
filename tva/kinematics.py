@@ -15,11 +15,15 @@ rather than lagged.
 When flow.json is present (`tva flow`), each axis fuses TWO measurements:
 z_p (homography-mapped bbox center, adaptive R_p as before) and z_v (median
 LK-corner world displacement / dt, own R_v, Mahalanobis-gated). z_v is
-immune to homography-chain drift — consecutive frames share the chain error
-— so speeds stay bounded at clip ends even on corrupted registration, and a
-stopped car reads ~0 by construction. Before filtering, a Montanino-Punzo
-prefilter drops impossible position jumps (> 2 car_len/frame) and clips
-accel spikes in the z_v stream.
+immune to ACCUMULATED homography-chain drift — consecutive frames share the
+chain error — so speeds stay bounded at clip ends even on corrupted
+registration, and a stopped car reads ~0 by construction. What z_v does
+inherit is the per-frame chain increment error ("slip", ~0.2 px/frame
+mid-clip, 1-2 px/frame while the drone translates hard): ZvBias fits that
+slip per frame as an affine field over static vehicles and both subtracts
+it from z_v and converts it into distrust of z_p/z_v (see ZvBias). Before
+filtering, a Montanino-Punzo prefilter drops impossible position jumps
+(> 2 car_len/frame) and clips accel spikes in the z_v stream.
 """
 import math
 
@@ -32,9 +36,9 @@ STOP_SPEED_FRAC = 0.10         # stopped if speed < frac * median car length /s
 MOVE_SPEED_FRAC = 0.22         # hysteresis: moving again above this
 MIN_STATE_RUN_S = 0.4          # ignore state flickers shorter than this
 SIGMA_MEAS_FRAC = 0.04         # position noise, frac of car_len (bbox jitter)
-SIGMA_JERK_FRAC = 1.0          # white-jerk process intensity, frac of car_len
+SIGMA_JERK_FRAC = 0.35          # white-jerk process intensity, frac of car_len
 ZV_GATE_SIGMA = 3.5            # Mahalanobis gate on velocity measurements
-ZV_SIGMA_IMG_PX = 0.15         # LK sub-pixel matching noise floor (image px)
+ZV_SIGMA_IMG_PX = 0.4          # z_v noise floor (image px per frame)
 JUMP_CARLEN_PER_FRAME = 2.0    # prefilter: drop z_p jumps beyond this
 ZV_AMAX_CARLEN = 2.5           # prefilter: accel bound for z_v spikes (/s^2)
 ZV_SPIKE_WIN_S = 0.2           # rolling-median half-window for spike clip
@@ -106,7 +110,8 @@ def _local_sigma(t, res, floor, win_s=0.5):
     return out
 
 
-def smooth_track(t, pts, car_len, jac_scale=None, zv=None, sig_v=None):
+def smooth_track(t, pts, car_len, jac_scale=None, zv=None, sig_v=None,
+                 sig_p_extra=None):
     """Smoothed positions and velocities for an (n,2) world-point array.
 
     Measurement noise is adaptive twice over: jac_scale (local world-px per
@@ -119,24 +124,39 @@ def smooth_track(t, pts, car_len, jac_scale=None, zv=None, sig_v=None):
 
     zv: optional (n,2) LK velocity measurements (NaN rows where absent),
     sig_v: per-sample velocity sigma. Fused per axis with its own R_v.
+    sig_p_extra: per-sample additional position sigma (world px), e.g.
+    integrated registration slip — combined in quadrature.
     """
     sm = SIGMA_MEAS_FRAC * car_len
     sj = SIGMA_JERK_FRAC * car_len
     sig = np.full(len(t), sm)
     if jac_scale is not None:
         sig = sm * np.maximum(np.asarray(jac_scale), 1.0)
+    if sig_p_extra is not None:
+        sig = np.hypot(sig, sig_p_extra)
     zvx = zv[:, 0] if zv is not None else None
     zvy = zv[:, 1] if zv is not None else None
 
-    def run_pass(sig_arr):
-        xs, vx, _ = _rts_1d(t, pts[:, 0], sig_arr, sj, zvx, sig_v)
-        ys, vy, _ = _rts_1d(t, pts[:, 1], sig_arr, sj, zvy, sig_v)
+    def run_pass(sig_arr, sig_v_arr):
+        xs, vx, _ = _rts_1d(t, pts[:, 0], sig_arr, sj, zvx, sig_v_arr)
+        ys, vy, _ = _rts_1d(t, pts[:, 1], sig_arr, sj, zvy, sig_v_arr)
         return xs, ys, vx, vy
 
-    xs, ys, vx, vy = run_pass(sig)
+    xs, ys, vx, vy = run_pass(sig, sig_v)
     res = np.hypot(pts[:, 0] - xs, pts[:, 1] - ys)
     sig = np.maximum(sig, _local_sigma(t, res, sm))
-    return run_pass(sig)
+    if zv is not None:
+        # residual reweighting for R_v too: the per-measurement sigma only
+        # models corner-matching noise; frame-to-frame environmental noise
+        # (shadows, glare, bbox content drift) shows up as velocity
+        # residuals and would otherwise be chased into the speed curve
+        fin = np.flatnonzero(np.isfinite(zvx))
+        if len(fin) >= 5:
+            rv = np.hypot(zvx[fin] - vx[fin], zvy[fin] - vy[fin])
+            loc = _local_sigma(t[fin], rv, float(np.min(sig_v[fin])))
+            sig_v = sig_v.copy()
+            sig_v[fin] = np.maximum(sig_v[fin], loc)
+    return run_pass(sig, sig_v)
 
 
 def prefilter_jumps(frames, pts, car_len):
@@ -197,7 +217,7 @@ def wavelet_onset(t, speed, a_idx, fps):
     E = np.zeros(n)
     for w_s in WAVELET_SCALES_S:
         a = max(w_s * fps, 1.5)
-        width = min(int(10 * a) | 1, 2 * n - 1)
+        width = min(int(10 * a) | 1, n if n % 2 else n - 1)
         c = np.convolve(speed, _ricker(width, a), mode="same")
         E += c * c
     lo = max(0, a_idx - int(WAVELET_SEARCH_BACK_S * fps))
@@ -252,9 +272,23 @@ def state_runs(stopped, fps):
 def load_flow(ws):
     """flow.json -> {track_id: {frame: (vx, vy, sigma_v)}}, or None.
 
-    sigma_v combines the LK sub-pixel matching floor (ZV_SIGMA_IMG_PX image
-    px, amplified by the local homography Jacobian) with the standard error
-    of the median world displacement (1.858 * MAD / sqrt(n))."""
+    Measurements are normalized by the local Jacobian scale of their frame's
+    homography. The world displacement factors as J_f * (camera-compensated
+    image displacement): the compensation comes from the RELATIVE homography
+    between adjacent frames (well-estimated even where the accumulated chain
+    is corrupt), so ALL of the chain corruption enters through J_f alone —
+    dividing it out leaves a bounded velocity that equals world velocity
+    wherever registration is sane (jac ~ 1) and stays plausible where the
+    chain's scale has blown up 10x. sigma_v combines an image-px noise floor
+    with the standard error of the median displacement (1.858*MAD/sqrt(n),
+    also de-scaled by jac).
+
+    flow.json's background "bias" (ground-plane corners) is deliberately NOT
+    subtracted: the measured vehicles live on an elevated deck, and under
+    drone translation the ground moves differently (parallax), so the
+    ground slip is not the error the deck cars see — subtracting it made
+    parked-car z_v worse on the hero clip. The common-mode correction that
+    does work is _zv_bias (static vehicles, same plane)."""
     import os
     if not os.path.exists(ws.path("flow.json")):
         return None
@@ -265,11 +299,124 @@ def load_flow(ws):
         rec = {}
         for f, vx, vy, n, sp, jac in zip(tr["frames"], tr["vx"], tr["vy"],
                                          tr["n"], tr["spread"], tr["jac"]):
-            sig = max(ZV_SIGMA_IMG_PX * max(jac, 1.0),
-                      1.858 * sp / math.sqrt(n)) / dt
-            rec[f] = (vx, vy, sig)
+            j = max(jac, 1e-6)
+            sig = max(ZV_SIGMA_IMG_PX,
+                      1.858 * (sp / j) / math.sqrt(n)) / dt
+            rec[f] = (vx / j, vy / j, sig)
         out[tr["id"]] = rec
     return out
+
+
+BIAS_POOL_FRAMES = 2       # pool static samples over +/- this many frames
+BIAS_MIN_AFFINE = 10       # samples needed for an affine fit (else constant)
+BIAS_POS_SCALE = 1000.0    # position normalization for conditioning
+ZP_SLIP_TIMESCALE_S = 0.5  # coherent slip integrates into z_p error over this
+
+
+class ZvBias:
+    """Per-frame affine registration-slip field, fit on static vehicles.
+
+    Stopped/parked cars sit on the SAME plane as everything we measure, so
+    their (jac-normalized) z_v at each frame IS the registration slip every
+    measurement of that frame pair inherits — including the parallax
+    component that ground-plane background corners cannot see. The slip is
+    not spatially uniform (the differential of a projective registration
+    error is locally affine), so per frame we fit
+        slip(x, y) ~ A @ [x, y] + b
+    over static-vehicle samples pooled from +/- BIAS_POOL_FRAMES frames,
+    with one robust re-fit after trimming 3-MAD outliers. Static selection
+    is position-based (net world displacement < 1.5 car_len over >= 3 s),
+    independent of z_v, so the correction is not circular.
+
+    The fit doubles as a per-frame trust signal:
+    - field magnitude  -> coherent slip; integrates into z_p error over
+      ~ZP_SLIP_TIMESCALE_S, so it inflates R_p (the chain drifting under a
+      translating drone is exactly when box centers lie),
+    - residual MAD     -> incoherent slip; adds to R_v (frames where LK or
+      the relative homography fall apart, e.g. motion blur at clip ends).
+    """
+
+    def __init__(self, A, b, mad, n_static):
+        self.A, self.b, self.mad, self.n_static = A, b, mad, n_static
+
+    def slip(self, f, pts):
+        """Slip vectors (m,2) at world points pts for frame f."""
+        f = min(max(f, 0), len(self.b) - 1)
+        return (np.asarray(pts) / BIAS_POS_SCALE) @ self.A[f].T + self.b[f]
+
+    def sig_v_extra(self, f):
+        f = min(max(f, 0), len(self.mad) - 1)
+        return self.mad[f]
+
+
+def _zv_bias(data, flow, Hs, fps, car_len):
+    """Fit ZvBias from static vehicles; None if too few."""
+    static = []   # (track_id, {frame: world_pt})
+    for tr in data["tracks"]:
+        obs = [o for o in tr["obs"] if o[0] < len(Hs)]
+        if len(obs) < MIN_TRACK_FRAMES or tr["id"] not in flow:
+            continue
+        if (obs[-1][0] - obs[0][0]) / fps < 3.0:
+            continue
+        pts = {f: apply_h(Hs[f], [(cx, cy)])[0]
+               for f, cx, cy, *_ in obs}
+        arr = np.array(list(pts.values()))
+        k = min(9, len(arr) // 2)
+        net = np.hypot(*(np.median(arr[-k:], 0) - np.median(arr[:k], 0)))
+        if float(net) < 1.5 * car_len:
+            static.append((tr["id"], pts))
+    n = len(Hs) - 1
+    samples = [[] for _ in range(n)]   # per frame: (x, y, vx, vy)
+    for tid, pts in static:
+        for f, (vx, vy, _) in flow[tid].items():
+            if f < n and f in pts:
+                samples[f].append((pts[f][0], pts[f][1], vx, vy))
+    A = np.zeros((n, 2, 2))
+    b = np.full((n, 2), np.nan)
+    mad = np.full(n, np.nan)
+    for f in range(n):
+        pool = []
+        for g in range(max(0, f - BIAS_POOL_FRAMES),
+                       min(n, f + BIAS_POOL_FRAMES + 1)):
+            pool.extend(samples[g])
+        if len(pool) < 5:
+            continue
+        P = np.asarray(pool)
+        X, V = P[:, :2] / BIAS_POS_SCALE, P[:, 2:]
+        for _ in range(2):
+            if len(X) >= BIAS_MIN_AFFINE:
+                M = np.column_stack([X, np.ones(len(X))])
+                coef, *_ = np.linalg.lstsq(M, V, rcond=None)
+                pred = M @ coef
+            else:
+                coef = None
+                pred = np.tile(np.median(V, axis=0), (len(V), 1))
+            res = np.hypot(*(V - pred).T)
+            scale = float(np.median(res))
+            keep = res < max(3 * 1.4826 * scale, 1e-6)
+            if keep.sum() < 5 or keep.all():
+                break
+            X, V = X[keep], V[keep]
+        if coef is not None:
+            A[f] = coef[:2].T
+            b[f] = coef[2]
+        else:
+            b[f] = np.median(V, axis=0)
+        mad[f] = scale
+    ok = np.flatnonzero(np.isfinite(b[:, 0]))
+    if len(ok) < 10:
+        return None
+    idx = np.arange(n)
+    for j in range(2):
+        b[:, j] = np.interp(idx, ok, b[ok, j])
+        for i in range(2):
+            A[:, j, i] = np.interp(idx, ok, A[ok, j, i])
+    mad = np.interp(idx, np.flatnonzero(np.isfinite(mad)),
+                    mad[np.isfinite(mad)])
+    print(f"z_v bias field from {len(static)} static vehicles; "
+          f"median |b| {float(np.median(np.hypot(*b.T))):.1f} px/s, "
+          f"median MAD {float(np.median(mad)):.1f} px/s")
+    return ZvBias(A, b, mad, len(static))
 
 
 def run(ws):
@@ -292,6 +439,10 @@ def run(ws):
     print(f"median car length ~{car_len:.0f}px -> stop<{v_stop:.0f}px/s, "
           f"move>{v_move:.0f}px/s")
 
+    zv_bias = None
+    if flow is not None:
+        zv_bias = _zv_bias(data, flow, Hs, fps, car_len)
+
     n_jump_dropped = 0
     world_tracks = []
     stop_events = []
@@ -313,7 +464,7 @@ def run(ws):
         t = np.array(frames) / fps
         jac = np.array([jacobian_scale(Hs[f], (cx, cy))
                         for f, cx, cy, *_ in obs])
-        zv = sig_v = None
+        zv = sig_v = sig_p_extra = None
         if flow is not None and tr["id"] in flow:
             rec = flow[tr["id"]]
             zv = np.full((len(frames), 2), np.nan)
@@ -323,9 +474,20 @@ def run(ws):
                     vx_m, vy_m, sg = rec[f]
                     zv[i] = (vx_m, vy_m)
                     sig_v[i] = sg
+        if zv_bias is not None:
+            slips = np.vstack([zv_bias.slip(f, [p])
+                               for f, p in zip(frames, pts)])
+            sig_p_extra = np.hypot(*slips.T) * ZP_SLIP_TIMESCALE_S
+            if zv is not None:
+                fin = np.isfinite(zv[:, 0])
+                zv[fin] -= slips[fin]
+                madd = np.array([zv_bias.sig_v_extra(f) for f in frames])
+                sig_v = np.hypot(sig_v, madd)
+        if zv is not None:
             zv = clip_zv_spikes(t, zv, car_len)
         xs, ys, vx, vy = smooth_track(t, pts, car_len, jac_scale=jac,
-                                      zv=zv, sig_v=sig_v)
+                                      zv=zv, sig_v=sig_v,
+                                      sig_p_extra=sig_p_extra)
         speed = np.hypot(vx, vy)
 
         # hysteresis state machine
@@ -371,18 +533,33 @@ def run(ws):
         path_total = float(np.hypot(np.diff(xs), np.diff(ys)).sum())
         static = bool(life >= 3.0 and net < 1.5 * car_len
                       and path_total < 4.0 * car_len)
+        zv_mag = zv_med = None
+        if zv is not None:
+            zv_mag = [round(float(np.hypot(*m)), 1)
+                      if np.isfinite(m[0]) else None for m in zv]
+            fin = np.isfinite(zv[:, 0])
+            if fin.sum() >= 10:
+                zv_med = [round(float(np.median(zv[fin, 0])), 2),
+                          round(float(np.median(zv[fin, 1])), 2)]
         world_tracks.append({
             "id": tr["id"], "cls": tr["cls"], "static": static,
             "frames": frames,
             "x": [round(float(v), 1) for v in xs],
             "y": [round(float(v), 1) for v in ys],
             "speed": [round(float(v), 1) for v in speed],
+            "zv_mag": zv_mag, "zv_med": zv_med,
             "runs": [[s, frames[a], frames[b]] for s, a, b in runs],
         })
 
     ws.save("world_tracks.json", {
         "car_len_px": car_len, "v_stop": v_stop, "v_move": v_move,
         "velocity_fusion": flow is not None,
+        "zv_bias": None if zv_bias is None else {
+            "n_static": zv_bias.n_static,
+            "b": [[round(float(a), 3), round(float(c), 3)]
+                  for a, c in zv_bias.b],
+            "mad": [round(float(v), 3) for v in zv_bias.mad],
+        },
         "tracks": world_tracks, "stop_events": stop_events,
     })
     if n_jump_dropped:

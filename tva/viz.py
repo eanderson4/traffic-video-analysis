@@ -124,7 +124,12 @@ def speed_qa(ws, n_tracks=10, track_ids=None, suffix=""):
                          np.gradient(pts[:, 1], t_raw))
         t_sm = np.array(tr["frames"]) / fps
         ax.plot(t_raw, v_raw, color="0.65", lw=1, label="raw diff")
-        if tr["id"] in flow:
+        if tr.get("zv_mag"):
+            zt = [tf for tf, m in zip(t_sm, tr["zv_mag"]) if m is not None]
+            zm = [m for m in tr["zv_mag"] if m is not None]
+            ax.plot(zt, zm, ".", color="#1a9c50", ms=2.5,
+                    label="|z_v| (corrected)")
+        elif tr["id"] in flow:
             fl = flow[tr["id"]]
             ax.plot(np.array(fl["frames"]) / fps,
                     np.hypot(fl["vx"], fl["vy"]), ".", color="#1a9c50",
