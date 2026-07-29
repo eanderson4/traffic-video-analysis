@@ -5,3 +5,4 @@ __pycache__/
 *.mov
 work/
 .venv/
+testdata/

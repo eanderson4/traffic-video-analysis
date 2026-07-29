@@ -76,14 +76,20 @@ def spacetime(ws, out_w=1400, out_h=1000):
     print(f"wrote {out}")
 
 
-def speed_qa(ws, n_tracks=10):
+def speed_qa(ws, n_tracks=10, track_ids=None, suffix=""):
     """Raw vs smoothed speed profiles for tracks with stop events.
 
     Grey = central-difference speed of the raw projected bbox centers (what
     the smoother has to work with); color = the smoothed speed we publish.
     If the color curve still wiggles like the grey one, the smoother is too
-    loose; if it lags the stop, too stiff.
+    loose; if it lags the stop, too stiff. Green dots = |z_v| LK-flow
+    velocity measurements when flow.json exists.
+
+    track_ids: explicit list of ids to plot (default: longest tracks that
+    have stop events). suffix goes into the output filename.
     """
+    import os
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -98,9 +104,16 @@ def speed_qa(ws, n_tracks=10):
     for ev in wt["stop_events"]:
         ev_of.setdefault(ev["track"], []).append(ev["t"])
     raw_obs = {tr["id"]: tr["obs"] for tr in ws.load("tracks.json")["tracks"]}
+    flow = {}
+    if os.path.exists(ws.path("flow.json")):
+        flow = {tr["id"]: tr for tr in ws.load("flow.json")["tracks"]}
 
-    picks = sorted((tr for tr in wt["tracks"] if tr["id"] in ev_of),
-                   key=lambda tr: -len(tr["frames"]))[:n_tracks]
+    if track_ids:
+        by_id = {tr["id"]: tr for tr in wt["tracks"]}
+        picks = [by_id[i] for i in track_ids if i in by_id]
+    else:
+        picks = sorted((tr for tr in wt["tracks"] if tr["id"] in ev_of),
+                       key=lambda tr: -len(tr["frames"]))[:n_tracks]
     fig, axes = plt.subplots(len(picks), 1, figsize=(12, 2.1 * len(picks)),
                              sharex=True)
     for ax, tr in zip(np.atleast_1d(axes), picks):
@@ -111,10 +124,15 @@ def speed_qa(ws, n_tracks=10):
                          np.gradient(pts[:, 1], t_raw))
         t_sm = np.array(tr["frames"]) / fps
         ax.plot(t_raw, v_raw, color="0.65", lw=1, label="raw diff")
+        if tr["id"] in flow:
+            fl = flow[tr["id"]]
+            ax.plot(np.array(fl["frames"]) / fps,
+                    np.hypot(fl["vx"], fl["vy"]), ".", color="#1a9c50",
+                    ms=2.5, label="|z_v| flow")
         ax.plot(t_sm, tr["speed"], color="#2e5bff", lw=2, label="smoothed")
         ax.axhline(v_stop, color="#eb3c32", lw=0.8, ls="--")
         ax.axhline(v_move, color="#3cc85a", lw=0.8, ls="--")
-        for te in ev_of[tr["id"]]:
+        for te in ev_of.get(tr["id"], []):
             ax.axvline(te, color="#eb3c32", lw=1.2)
         ax.set_ylabel(f"tr {tr['id']}", fontsize=8)
         ax.set_ylim(0, max(np.percentile(v_raw, 98), 3 * v_move))
@@ -123,7 +141,7 @@ def speed_qa(ws, n_tracks=10):
     fig.suptitle("speed profiles: raw central-diff vs published (px/s); "
                  "red vline = stop onset", fontsize=10)
     fig.tight_layout()
-    out = f"{ws.qa}/speed-profiles.png"
+    out = f"{ws.qa}/speed-profiles{suffix}.png"
     fig.savefig(out, dpi=110)
     plt.close(fig)
     print(f"wrote {out}")
