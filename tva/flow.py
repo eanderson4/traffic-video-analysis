@@ -31,6 +31,10 @@ MIN_ROI_PX = 8          # skip boxes whose eroded side is smaller than this
 MIN_CORNERS = 4         # reject measurement below this many survivors
 FB_ERR_PX = 0.6         # forward-backward consistency gate (image px)
 SPREAD_MAX_FRAC = 0.06  # reject if MAD of world displacements > frac*car_len
+BG_MAX_CORNERS = 400    # background corners for per-frame slip estimation
+BG_MIN_DIST = 30
+BG_DILATE_FRAC = 0.15   # bbox dilation when masking vehicles out
+BG_MIN_CORNERS = 20     # below this the frame's bias is left missing
 LK_PARAMS = dict(
     winSize=(21, 21), maxLevel=3,
     criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
@@ -75,12 +79,15 @@ def run(ws):
 
     # frame -> [(track_id, cx, cy, w, h)] for obs with a usable next frame
     per_frame = {}
+    all_boxes = {}   # every obs regardless of next frame, for the bg mask
     for tr in data["tracks"]:
         for f, cx, cy, w, h, conf in tr["obs"]:
+            all_boxes.setdefault(f, []).append((cx, cy, w, h))
             if f + 1 < len(Hs):
                 per_frame.setdefault(f, []).append((tr["id"], cx, cy, w, h))
 
     out = {}   # track_id -> lists
+    bias = [None] * max(len(Hs) - 1, 0)   # per-frame registration slip
     n_meas = n_rej_corners = n_rej_spread = 0
     cap = cv2.VideoCapture(meta["src"])
     ok, frame = cap.read()
@@ -102,6 +109,23 @@ def run(ws):
                 n_rej_corners += 1
                 continue
             batches.append((tid, cx, cy, pts))
+        # background corners (all vehicle boxes masked out, dilated 15%):
+        # their world displacement SHOULD be zero, so its median measures
+        # the frame pair's registration slip — the common-mode error that
+        # every z_v at this frame inherits. Cached so the filter can
+        # subtract it. tid=None marks the pseudo-batch.
+        if f < len(bias):
+            mask = np.full(prev.shape, 255, np.uint8)
+            Hh, Ww = prev.shape
+            for cx, cy, w, h in all_boxes.get(f, []):
+                dw, dh = w * (1 + BG_DILATE_FRAC), h * (1 + BG_DILATE_FRAC)
+                mask[max(int(cy - dh / 2), 0):min(int(cy + dh / 2), Hh),
+                     max(int(cx - dw / 2), 0):min(int(cx + dw / 2), Ww)] = 0
+            bg = cv2.goodFeaturesToTrack(prev, BG_MAX_CORNERS,
+                                         CORNER_QUALITY, BG_MIN_DIST,
+                                         mask=mask)
+            if bg is not None and len(bg) >= BG_MIN_CORNERS:
+                batches.append((None, 0, 0, bg.reshape(-1, 2)))
         if batches:
             p0 = np.concatenate([b[3] for b in batches]).astype(
                 np.float32).reshape(-1, 1, 2)
@@ -118,13 +142,24 @@ def run(ws):
                 g = good[i:i + n]
                 a, b = p0f[i:i + n][g], p1f[i:i + n][g]
                 i += n
+                if tid is None:
+                    if g.sum() >= BG_MIN_CORNERS:
+                        d = apply_h(Hs[f + 1], b) - apply_h(Hs[f], a)
+                        m = np.median(d, axis=0)
+                        bias[f] = [round(float(m[0] / dt), 3),
+                                   round(float(m[1] / dt), 3), int(g.sum())]
+                    continue
                 if g.sum() < MIN_CORNERS:
                     n_rej_corners += 1
                     continue
                 d = apply_h(Hs[f + 1], b) - apply_h(Hs[f], a)
                 med = np.median(d, axis=0)
                 spread = float(np.median(np.linalg.norm(d - med, axis=1)))
-                if spread > spread_max:
+                jac = jacobian_scale(Hs[f], (cx, cy))
+                # gate in image scale: where the chain's Jacobian has blown
+                # up, world-px spread inflates with it and says nothing
+                # about flow quality
+                if spread / max(jac, 1e-6) > spread_max:
                     n_rej_spread += 1
                     continue
                 rec = out.setdefault(tid, {"frames": [], "vx": [], "vy": [],
@@ -134,7 +169,7 @@ def run(ws):
                 rec["vy"].append(round(float(med[1] / dt), 2))
                 rec["n"].append(int(g.sum()))
                 rec["spread"].append(round(spread, 3))
-                rec["jac"].append(round(jacobian_scale(Hs[f], (cx, cy)), 3))
+                rec["jac"].append(round(jac, 3))
                 n_meas += 1
         prev = cur
         f += 1
@@ -146,7 +181,10 @@ def run(ws):
         "car_len_px": car_len, "dt": dt,
         "erode_frac": ERODE_FRAC, "fb_err_px": FB_ERR_PX,
         "spread_max": spread_max,
+        "bias": bias,
         "tracks": [{"id": tid, **rec} for tid, rec in sorted(out.items())],
     })
+    n_bias = sum(1 for b in bias if b is not None)
     print(f"{n_meas} z_v measurements on {len(out)} tracks "
-          f"(rejected: {n_rej_corners} few-corners, {n_rej_spread} spread)")
+          f"(rejected: {n_rej_corners} few-corners, {n_rej_spread} spread); "
+          f"bg slip measured on {n_bias}/{len(bias)} frame pairs")
