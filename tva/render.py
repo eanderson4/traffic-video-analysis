@@ -86,11 +86,15 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
         except FileNotFoundError:
             print("roads.json missing - run `tva roads` first; skipping layer")
 
-    # per-track median bbox size (frame px) for marker radius
-    size_of = {}
+    # per-track median bbox size (frame px) for marker radius, and observed
+    # centers: markers are drawn on the DETECTION, never on the smoothed
+    # world estimate (which coasts away from the car wherever the projection
+    # is too distorted to trust measurements)
+    size_of, px_of = {}, {}
     for tr in ws.load("tracks.json")["tracks"]:
         size_of[tr["id"]] = float(np.median([max(o[3], o[4])
                                              for o in tr["obs"]]))
+        px_of[tr["id"]] = {o[0]: (o[1], o[2]) for o in tr["obs"]}
 
     # parked = static AND off every inferred road: don't paint them at all
     # (their "speed" is pure registration noise, so they twitch with color)
@@ -144,10 +148,15 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
             r = max(6, int(0.30 * size_of.get(tr["id"], 80)))
             if hot:
                 r = int(r * 1.8)
-            # world path over the last TRAIL_S, drawn in this frame's view
+            # world path over the last TRAIL_S, drawn in this frame's view,
+            # translated so it ends exactly on the detected bbox center
             j0 = max(0, k - trail_n)
             wpts = np.column_stack([tr["x"][j0:k + 1], tr["y"][j0:k + 1]])
-            fpts = apply_h(Hinv[i], wpts).astype(np.int32)
+            fpts = apply_h(Hinv[i], wpts)
+            obs_px = px_of[tr["id"]].get(i)
+            if obs_px is not None:
+                fpts += np.asarray(obs_px) - fpts[-1]
+            fpts = fpts.astype(np.int32)
             if len(fpts) > 1:
                 cv2.polylines(layer, [fpts], False, col, max(2, r // 4),
                               cv2.LINE_AA)
