@@ -113,8 +113,17 @@ def run(ws):
                 "t": round(frames[a] / fps, 2),
                 "x": round(float(xs[a]), 1), "y": round(float(ys[a]), 1),
             })
+        # static = parked or gridlocked the whole time we saw it: barely any
+        # net displacement or path over a multi-second life. These are the
+        # strongest registration anchors in the scene (see refine.anchors).
+        life = (frames[-1] - frames[0]) / fps
+        net = float(np.hypot(xs[-1] - xs[0], ys[-1] - ys[0]))
+        path_total = float(np.hypot(np.diff(xs), np.diff(ys)).sum())
+        static = bool(life >= 3.0 and net < 1.5 * car_len
+                      and path_total < 4.0 * car_len)
         world_tracks.append({
-            "id": tr["id"], "cls": tr["cls"], "frames": frames,
+            "id": tr["id"], "cls": tr["cls"], "static": static,
+            "frames": frames,
             "x": [round(float(v), 1) for v in xs],
             "y": [round(float(v), 1) for v in ys],
             "speed": [round(float(v), 1) for v in speed],

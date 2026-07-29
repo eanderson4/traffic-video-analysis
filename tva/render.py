@@ -33,7 +33,13 @@ def road_geometry(road):
     lanes = road["lanes"]
     hw = road["lane_halfwidth"]
     lines = []
-    if len(lanes) > 1:
+    bounds = road.get("boundaries")
+    if bounds and len(bounds) >= 2:
+        # measured painted lines: outermost are edges, the rest dividers
+        for kind, off in ([("edge", bounds[0]), ("edge", bounds[-1])] +
+                          [("divider", b) for b in bounds[1:-1]]):
+            lines.append((kind, np.column_stack([cx, cy]) + nrm * off))
+    elif len(lanes) > 1:
         for kind, off in (
                 [("edge", lanes[0] - hw), ("edge", lanes[-1] + hw)] +
                 [("divider", (a + b) / 2) for a, b in zip(lanes, lanes[1:])]):
@@ -86,9 +92,27 @@ def run(ws, out=None, out_w=1920, layers=("roads", "cars")):
         size_of[tr["id"]] = float(np.median([max(o[3], o[4])
                                              for o in tr["obs"]]))
 
+    # parked = static AND off every inferred road: don't paint them at all
+    # (their "speed" is pure registration noise, so they twitch with color)
+    parked = set()
+    if roads:
+        from .kinematics import station_of
+        for tr in wt["tracks"]:
+            if not tr.get("static"):
+                continue
+            mx = np.array([np.median(tr["x"])])
+            my = np.array([np.median(tr["y"])])
+            dmin = min(station_of(r["x"], r["y"], mx, my)[1][0]
+                       for r in roads)
+            if dmin > 3.5 * wt["car_len_px"]:
+                parked.add(tr["id"])
+        print(f"{len(parked)} parked vehicles hidden")
+
     # frame index -> [(track, obs index)]
     per_frame = [[] for _ in range(n)]
     for tr in wt["tracks"]:
+        if tr["id"] in parked:
+            continue
         for k, f in enumerate(tr["frames"]):
             if f < n:
                 per_frame[f].append((tr, k))

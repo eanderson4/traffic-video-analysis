@@ -12,7 +12,7 @@ def main():
     p.add_argument("--work", required=True)
 
     for name in ("stabilize", "world", "spacetime", "worldmap", "render",
-                 "roads"):
+                 "roads", "plate", "segment", "anchors"):
         p = sub.add_parser(name)
         p.add_argument("--work", required=True)
 
@@ -47,6 +47,15 @@ def main():
     elif args.cmd == "roads":
         from . import roads
         roads.infer(ws)
+    elif args.cmd == "anchors":
+        from . import refine
+        refine.anchors(ws)
+    elif args.cmd == "plate":
+        from . import plate
+        plate.build(ws)
+    elif args.cmd == "segment":
+        from . import segment
+        segment.run(ws)
     elif args.cmd == "render":
         from . import render
         render.run(ws)
