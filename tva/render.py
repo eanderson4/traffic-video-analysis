@@ -22,6 +22,8 @@ R_MAX = 40             # marker radius cap (src-frame px)
 TRAIL_MIN_LEN = 0.5    # car_len; shorter world paths draw no trail
 TRAIL_STRAIGHT = 0.8   # net/path ratio below this = registration curl
                        # (a real 90-degree turn over TRAIL_S is ~0.90)
+FOCUS_R = 1.7          # focus-lane marker radius multiplier
+FOCUS_RING_W = 5       # focus-lane white outline thickness
 
 # per-road hues (BGR), cycled
 ROAD_COLORS = [(255, 91, 46), (255, 200, 0), (180, 0, 255), (0, 200, 255),
@@ -75,6 +77,37 @@ def draw_roads(layer, roads, Hinv_i):
             cv2.polylines(layer, [fpts], False, col, 3, cv2.LINE_AA)
 
 
+def focus_lane_ids(wt, roads, spec):
+    """Track ids riding the hand-picked lane in focus_lane.json: median
+    signed offset from the road centerline inside spec's offset_band."""
+    road = roads[spec["road"]]
+    rx, ry = np.asarray(road["x"]), np.asarray(road["y"])
+    tang = np.gradient(np.column_stack([rx, ry]), axis=0)
+    tang /= np.maximum(np.hypot(tang[:, 0], tang[:, 1])[:, None], 1e-9)
+    nrm = np.column_stack([-tang[:, 1], tang[:, 0]])
+    lo, hi = spec["offset_band"]
+    ids = set(spec.get("include", []))
+    for tr in wt["tracks"]:
+        x, y = np.asarray(tr["x"]), np.asarray(tr["y"])
+        d2 = (rx[None, :] - x[:, None]) ** 2 + (ry[None, :] - y[:, None]) ** 2
+        j = d2.argmin(axis=1)
+        if np.median(np.sqrt(d2[np.arange(len(x)), j])) > spec["max_dist"]:
+            continue
+        off = np.median((x - rx[j]) * nrm[j, 0] + (y - ry[j]) * nrm[j, 1])
+        if lo <= off <= hi:
+            ids.add(tr["id"])
+    return ids - set(spec.get("exclude", []))
+
+
+def neon(col):
+    """Push a BGR color to full saturation/value: the focus-lane variant of
+    the speed ramp (same red=stopped/green=moving semantics, louder)."""
+    px = np.uint8([[col]])
+    hsv = cv2.cvtColor(px, cv2.COLOR_BGR2HSV)
+    hsv[0, 0, 1:] = 255
+    return tuple(int(c) for c in cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0])
+
+
 def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
     meta = ws.meta
     fps, n = meta["fps"], meta["n_frames"]
@@ -103,6 +136,14 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
         size_of[tr["id"]] = float(np.median([max(o[3], o[4])
                                              for o in tr["obs"]]))
         px_of[tr["id"]] = {o[0]: (o[1], o[2]) for o in tr["obs"]}
+
+    # focus_lane.json: hand-picked lane whose cars get the loud styling so
+    # the stop wave marching up one lane is impossible to miss
+    try:
+        focus = focus_lane_ids(wt, roads, ws.load("focus_lane.json"))
+        print(f"{len(focus)} vehicles in focus lane")
+    except FileNotFoundError:
+        focus = set()
 
     # statics.json: hand-enforced known-fixed zones (parking lots, depots) in
     # world px. Registration extrapolation drifts in off-plane corners, so
@@ -171,6 +212,7 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
         if not ok:
             break
         layer = frame.copy()
+        focus_ops = []          # focus-lane draws go on top of the blend
         if roads_draw and roads:
             draw_roads(layer, roads, Hinv[i])
         for tr, k in per_frame[i] if "cars" in layers else []:
@@ -209,8 +251,13 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
             seg = np.diff(wpts, axis=0)
             plen = float(np.hypot(seg[:, 0], seg[:, 1]).sum())
             net = float(np.hypot(*(wpts[-1] - wpts[0])))
-            if (len(fpts) > 1 and plen > TRAIL_MIN_LEN * car_len
-                    and net > TRAIL_STRAIGHT * plen):
+            trail_ok = (len(fpts) > 1 and plen > TRAIL_MIN_LEN * car_len
+                        and net > TRAIL_STRAIGHT * plen)
+            if tr["id"] in focus:
+                focus_ops.append((fpts, neon(col),
+                                  int(r * FOCUS_R), trail_ok))
+                continue
+            if trail_ok:
                 cv2.polylines(layer, [fpts], False, col, max(2, r // 4),
                               cv2.LINE_AA)
             if hot:
@@ -218,7 +265,7 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
                            3, cv2.LINE_AA)
             cv2.circle(layer, tuple(fpts[-1]), r, col, -1, cv2.LINE_AA)
         for ev, f0 in rings:
-            if f0 <= i < f0 + ring_n:
+            if f0 <= i < f0 + ring_n and ev["track"] not in focus:
                 age = (i - f0) / ring_n
                 p = apply_h(Hinv[i], [(ev["x"], ev["y"])])[0].astype(int)
                 rr = int(30 + 90 * age)
@@ -226,6 +273,22 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
                 cv2.circle(layer, tuple(p), rr, (c, c, c), 4, cv2.LINE_AA)
         frame = cv2.addWeighted(layer, LAYER_ALPHA, frame,
                                 1 - LAYER_ALPHA, 0)
+        # focus lane on top at full opacity: neon speed color, bigger,
+        # thick white outline, heavier trail
+        for fpts, col, r, trail_ok in focus_ops:
+            if trail_ok:
+                cv2.polylines(frame, [fpts], False, col, max(3, r // 3),
+                              cv2.LINE_AA)
+            cv2.circle(frame, tuple(fpts[-1]), r + FOCUS_RING_W // 2 + 1,
+                       (255, 255, 255), FOCUS_RING_W, cv2.LINE_AA)
+            cv2.circle(frame, tuple(fpts[-1]), r, col, -1, cv2.LINE_AA)
+        for ev, f0 in rings:
+            if f0 <= i < f0 + ring_n and ev["track"] in focus:
+                age = (i - f0) / ring_n
+                p = apply_h(Hinv[i], [(ev["x"], ev["y"])])[0].astype(int)
+                rr = int(40 + 120 * age)
+                c = int(255 * (1 - 0.5 * age))
+                cv2.circle(frame, tuple(p), rr, (c, c, 255), 7, cv2.LINE_AA)
         small = cv2.resize(frame, (out_w, out_h))
         enc.stdin.write(small.tobytes())
         if i % int(3 * fps) == 0:
