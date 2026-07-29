@@ -11,7 +11,8 @@ def main():
     p.add_argument("src")
     p.add_argument("--work", required=True)
 
-    for name in ("stabilize", "world", "spacetime", "worldmap", "render"):
+    for name in ("stabilize", "world", "spacetime", "worldmap", "render",
+                 "roads"):
         p = sub.add_parser(name)
         p.add_argument("--work", required=True)
 
@@ -43,6 +44,9 @@ def main():
     elif args.cmd == "worldmap":
         from . import viz
         viz.world_map(ws)
+    elif args.cmd == "roads":
+        from . import roads
+        roads.infer(ws)
     elif args.cmd == "render":
         from . import render
         render.run(ws)

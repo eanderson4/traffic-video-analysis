@@ -18,8 +18,53 @@ TRAIL_S = 1.2          # seconds of path behind each car
 RING_S = 0.7           # stop-onset ring duration
 LAYER_ALPHA = 0.8      # overlay blend
 
+# per-road hues (BGR), cycled
+ROAD_COLORS = [(255, 91, 46), (255, 200, 0), (180, 0, 255), (0, 200, 255),
+               (0, 255, 140), (255, 128, 128)]
 
-def run(ws, out=None, out_w=1920):
+
+def road_geometry(road):
+    """World-plane polylines to draw for one road: (kind, pts) with kind in
+    edge|divider, plus chevron segments along the centerline."""
+    cx, cy = np.asarray(road["x"]), np.asarray(road["y"])
+    tang = np.gradient(np.column_stack([cx, cy]), axis=0)
+    tang /= np.maximum(np.hypot(tang[:, 0], tang[:, 1])[:, None], 1e-9)
+    nrm = np.column_stack([-tang[:, 1], tang[:, 0]])
+    lanes = road["lanes"]
+    hw = road["lane_halfwidth"]
+    lines = []
+    if len(lanes) > 1:
+        for kind, off in (
+                [("edge", lanes[0] - hw), ("edge", lanes[-1] + hw)] +
+                [("divider", (a + b) / 2) for a, b in zip(lanes, lanes[1:])]):
+            lines.append((kind, np.column_stack([cx, cy]) + nrm * off))
+    else:
+        # lanes unresolved: draw just the centerline
+        lines.append(("divider", np.column_stack([cx, cy]) + nrm * lanes[0]))
+    # direction chevrons on the centerline every ~4 vertices
+    chevrons = []
+    for i in range(2, len(cx) - 2, 4):
+        tip = np.array([cx[i], cy[i]]) + tang[i] * 14
+        b1 = np.array([cx[i], cy[i]]) - tang[i] * 10 + nrm[i] * 10
+        b2 = np.array([cx[i], cy[i]]) - tang[i] * 10 - nrm[i] * 10
+        chevrons.append(np.array([b1, tip, b2]))
+    return lines, chevrons
+
+
+def draw_roads(layer, roads, Hinv_i):
+    for road in roads:
+        col = ROAD_COLORS[road["id"] % len(ROAD_COLORS)]
+        lines, chevrons = road_geometry(road)
+        for kind, wpts in lines:
+            fpts = apply_h(Hinv_i, wpts).astype(np.int32)
+            cv2.polylines(layer, [fpts], False, col,
+                          4 if kind == "edge" else 2, cv2.LINE_AA)
+        for ch in chevrons:
+            fpts = apply_h(Hinv_i, ch).astype(np.int32)
+            cv2.polylines(layer, [fpts], False, col, 3, cv2.LINE_AA)
+
+
+def run(ws, out=None, out_w=1920, layers=("roads", "cars")):
     meta = ws.meta
     fps, n = meta["fps"], meta["n_frames"]
     w, h = meta["width"], meta["height"]
@@ -28,6 +73,12 @@ def run(ws, out=None, out_w=1920):
     Hinv = [np.linalg.inv(m) for m in Hs]
     wt = ws.load("world_tracks.json")
     v_stop, v_move = wt["v_stop"], wt["v_move"]
+    roads = []
+    if "roads" in layers:
+        try:
+            roads = ws.load("roads.json")["roads"]
+        except FileNotFoundError:
+            print("roads.json missing - run `tva roads` first; skipping layer")
 
     # per-track median bbox size (frame px) for marker radius
     size_of = {}
@@ -60,7 +111,9 @@ def run(ws, out=None, out_w=1920):
         if not ok:
             break
         layer = frame.copy()
-        for tr, k in per_frame[i]:
+        if roads:
+            draw_roads(layer, roads, Hinv[i])
+        for tr, k in per_frame[i] if "cars" in layers else []:
             v = tr["speed"][k]
             col = speed_color(v, v_stop, v_move)[::-1]  # RGB -> BGR
             r = max(6, int(0.30 * size_of.get(tr["id"], 80)))

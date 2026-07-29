@@ -96,13 +96,23 @@ def run(ws):
                 st = True
             stopped[i] = st
         runs = state_runs(stopped, fps)
-        for s, a, b in runs:
-            if s and a > 0:  # moving -> stopped transition inside the track
-                stop_events.append({
-                    "track": tr["id"], "frame": frames[a],
-                    "t": round(frames[a] / fps, 2),
-                    "x": round(float(xs[a]), 1), "y": round(float(ys[a]), 1),
-                })
+        for ri, (s, a, b) in enumerate(runs):
+            if not (s and a > 0 and ri > 0):
+                continue
+            # a real stop needs real motion first: the preceding moving run
+            # must cover >= 2 car lengths over >= 0.8 s, otherwise it's just
+            # gridlock creep re-triggering the threshold.
+            pa, pb = runs[ri - 1][1], runs[ri - 1][2]
+            path = float(np.hypot(np.diff(xs[pa:pb + 1]),
+                                  np.diff(ys[pa:pb + 1])).sum())
+            dur = (frames[pb] - frames[pa]) / fps
+            if path < 2.0 * car_len or dur < 0.8:
+                continue
+            stop_events.append({
+                "track": tr["id"], "frame": frames[a],
+                "t": round(frames[a] / fps, 2),
+                "x": round(float(xs[a]), 1), "y": round(float(ys[a]), 1),
+            })
         world_tracks.append({
             "id": tr["id"], "cls": tr["cls"], "frames": frames,
             "x": [round(float(v), 1) for v in xs],
