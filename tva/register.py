@@ -450,6 +450,37 @@ def register_keyframes(imgs, boxes, keys, ref, deck, cent):
     return H_key, edge_inl, refine_inl
 
 
+SMOOTH_WIN = 7            # Savitzky-Golay window (frames) for H params
+SMOOTH_ORDER = 2          # ... and polynomial order
+
+
+def smooth_homographies(Hs):
+    """Temporal Savitzky-Golay smoothing of the homography parameters.
+
+    Unlike a chain, every ref-frame H is estimated independently (ORB edge
+    + LK polish), so consecutive H's carry UNCORRELATED px-level jitter.
+    Absolute accuracy doesn't care, but any consumer of frame-to-frame
+    DIFFERENCES does: the K1 flow measurement (z_v) differences adjacent
+    frames' H's and amplifies the jitter by fps (~0.6 px of jitter ->
+    ~16 px/s of white velocity slip on the hero clip; integration
+    finding, R1+K1). The camera path is physically smooth, so a local
+    quadratic fit removes white estimation noise while following the real
+    trajectory even through the fast end move (a plain Gaussian lags
+    there). On the hero clip: differential slip 16.8 -> 9.7 px/s median,
+    absolute landmark residual unchanged (6.06 -> 6.22 world px median).
+    """
+    from scipy.signal import savgol_filter
+    if len(Hs) < SMOOTH_WIN:
+        return Hs
+    P = np.array([(H / H[2, 2]).ravel() for H in Hs])
+    Ps = savgol_filter(P, SMOOTH_WIN, SMOOTH_ORDER, axis=0)
+    out = []
+    for i in range(len(Hs)):
+        H = Ps[i].reshape(3, 3)
+        out.append(H / H[2, 2])
+    return out
+
+
 def run(ws):
     meta = ws.meta
     n, fps = meta["n_frames"], meta["fps"]
@@ -536,8 +567,10 @@ def run(ws):
 
     if flagged:
         print(f"low-inlier frames (<{MIN_INLIERS}): {flagged}")
+    Hs = smooth_homographies(Hs)
     ws.save("homographies.json", {
         "H": [H.tolist() for H in Hs],
+        "temporal_smoothing": f"savgol({SMOOTH_WIN},{SMOOTH_ORDER})",
         "inliers": inliers,
         "lk_inliers": lk_inliers,
         "method": "ref-frame",

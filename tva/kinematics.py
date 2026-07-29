@@ -288,10 +288,22 @@ def load_flow(ws):
     drone translation the ground moves differently (parallax), so the
     ground slip is not the error the deck cars see — subtracting it made
     parked-car z_v worse on the hero clip. The common-mode correction that
-    does work is _zv_bias (static vehicles, same plane)."""
+    does work is _zv_bias (static vehicles, same plane).
+
+    The J_f division above is the right defense ONLY for chained
+    homographies, where J_f itself carries the accumulated corruption.
+    On ref-frame (R1) homographies J_f is trusted geometry — its
+    variation is real perspective, and dividing it out would hand the
+    filter image-scale velocities to fuse against world-scale positions
+    (~20% systematic mismatch on the hero clip). There z_v is used raw
+    (world px/s) and only the image-px noise floor is scaled by J_f."""
     import os
     if not os.path.exists(ws.path("flow.json")):
         return None
+    try:
+        trust_jac = ws.load("homographies.json").get("method") == "ref-frame"
+    except FileNotFoundError:
+        trust_jac = False
     fl = ws.load("flow.json")
     dt = fl["dt"]
     out = {}
@@ -300,9 +312,14 @@ def load_flow(ws):
         for f, vx, vy, n, sp, jac in zip(tr["frames"], tr["vx"], tr["vy"],
                                          tr["n"], tr["spread"], tr["jac"]):
             j = max(jac, 1e-6)
-            sig = max(ZV_SIGMA_IMG_PX,
-                      1.858 * (sp / j) / math.sqrt(n)) / dt
-            rec[f] = (vx / j, vy / j, sig)
+            if trust_jac:
+                sig = max(ZV_SIGMA_IMG_PX * j,
+                          1.858 * sp / math.sqrt(n)) / dt
+                rec[f] = (vx, vy, sig)
+            else:
+                sig = max(ZV_SIGMA_IMG_PX,
+                          1.858 * (sp / j) / math.sqrt(n)) / dt
+                rec[f] = (vx / j, vy / j, sig)
         out[tr["id"]] = rec
     return out
 
@@ -334,6 +351,22 @@ class ZvBias:
       translating drone is exactly when box centers lie),
     - residual MAD     -> incoherent slip; adds to R_v (frames where LK or
       the relative homography fall apart, e.g. motion blur at clip ends).
+
+    The slip's TEMPORAL character depends on how the homographies were
+    estimated, and the fit must match it (integration finding, R1+K1):
+    - chained (v1 stabilize): H errors accumulate smoothly, so the
+      frame-pair slip is a drift RATE — coherent over neighbouring frames
+      (lag-1 autocorr +0.6 on the hero clip). Pooling +/-BIAS_POOL_FRAMES
+      steadies the fit, and the slip persists ~ZP_SLIP_TIMESCALE_S into
+      z_p error.
+    - ref-frame (R1 register): every frame is fit independently (ORB edge
+      + per-frame LK polish), so consecutive H's carry UNCORRELATED
+      px-level jitter; z_v differences them and multiplies by fps,
+      turning ~0.6 px of jitter into ~16 px/s of slip that flips sign
+      every frame (lag-1 autocorr -0.3). Pooling averages exactly this
+      signal away — the fit must be per frame (pool=0) — and the jitter
+      does NOT integrate into z_p (it IS the per-frame z_p error), so
+      R_p inflation uses one frame (dt), not ZP_SLIP_TIMESCALE_S.
     """
 
     def __init__(self, A, b, mad, n_static):
@@ -349,7 +382,7 @@ class ZvBias:
         return self.mad[f]
 
 
-def _zv_bias(data, flow, Hs, fps, car_len):
+def _zv_bias(data, flow, Hs, fps, car_len, pool=BIAS_POOL_FRAMES):
     """Fit ZvBias from static vehicles; None if too few."""
     static = []   # (track_id, {frame: world_pt})
     for tr in data["tracks"]:
@@ -375,13 +408,12 @@ def _zv_bias(data, flow, Hs, fps, car_len):
     b = np.full((n, 2), np.nan)
     mad = np.full(n, np.nan)
     for f in range(n):
-        pool = []
-        for g in range(max(0, f - BIAS_POOL_FRAMES),
-                       min(n, f + BIAS_POOL_FRAMES + 1)):
-            pool.extend(samples[g])
-        if len(pool) < 5:
+        grp = []
+        for g in range(max(0, f - pool), min(n, f + pool + 1)):
+            grp.extend(samples[g])
+        if len(grp) < 5:
             continue
-        P = np.asarray(pool)
+        P = np.asarray(grp)
         X, V = P[:, :2] / BIAS_POS_SCALE, P[:, 2:]
         for _ in range(2):
             if len(X) >= BIAS_MIN_AFFINE:
@@ -422,17 +454,30 @@ def _zv_bias(data, flow, Hs, fps, car_len):
 def run(ws):
     meta = ws.meta
     fps = meta["fps"]
-    Hs = [np.asarray(h) for h in ws.load("homographies.json")["H"]]
+    hom = ws.load("homographies.json")
+    Hs = [np.asarray(h) for h in hom["H"]]
+    # ref-frame homographies are estimated independently per frame, so
+    # their slip is white per frame-pair; chained ones drift smoothly.
+    # See ZvBias docstring — this changes both the fit pooling and how
+    # long slip is assumed to persist in the position measurements.
+    white_slip = hom.get("method") == "ref-frame"
     data = ws.load("tracks.json")
     flow = load_flow(ws)
     print("velocity fusion: ON (flow.json)" if flow else
           "velocity fusion: OFF (no flow.json; run `tva flow` first)")
 
-    # median car bbox size in world px -> speed thresholds
+    # Median car length in WORLD px -> speed thresholds. Image-plane bbox
+    # sizes must be scaled by the local Jacobian: on v1 chained
+    # homographies the reference plane is frame 0 (jac ~ 1, so this is a
+    # no-op), but R1's ref-frame plane is a mid-clip frame whose scale
+    # differs ~20%, and every car_len-derived quantity (v_stop/v_move,
+    # jerk bound, Edie slow threshold, px/s -> km/h) inherits the error
+    # if car_len stays in image px (integration bug, R1+K1).
     sizes = []
     for tr in data["tracks"]:
-        for f, cx, cy, w, h, conf in tr["obs"]:
-            sizes.append(max(w, h))
+        for f, cx, cy, w, h, conf in tr["obs"][::5]:
+            if f < len(Hs):
+                sizes.append(jacobian_scale(Hs[f], (cx, cy)) * max(w, h))
     car_len = float(np.median(sizes)) if sizes else 100.0
     v_stop = STOP_SPEED_FRAC * car_len
     v_move = MOVE_SPEED_FRAC * car_len
@@ -440,8 +485,13 @@ def run(ws):
           f"move>{v_move:.0f}px/s")
 
     zv_bias = None
+    slip_ts = 1.0 / fps if white_slip else ZP_SLIP_TIMESCALE_S
     if flow is not None:
-        zv_bias = _zv_bias(data, flow, Hs, fps, car_len)
+        zv_bias = _zv_bias(data, flow, Hs, fps, car_len,
+                           pool=0 if white_slip else BIAS_POOL_FRAMES)
+        if white_slip:
+            print("ref-frame homographies: per-frame slip fit (no pooling), "
+                  f"z_p slip timescale {slip_ts:.3f}s")
 
     n_jump_dropped = 0
     world_tracks = []
@@ -477,7 +527,7 @@ def run(ws):
         if zv_bias is not None:
             slips = np.vstack([zv_bias.slip(f, [p])
                                for f, p in zip(frames, pts)])
-            sig_p_extra = np.hypot(*slips.T) * ZP_SLIP_TIMESCALE_S
+            sig_p_extra = np.hypot(*slips.T) * slip_ts
             if zv is not None:
                 fin = np.isfinite(zv[:, 0])
                 zv[fin] -= slips[fin]

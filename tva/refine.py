@@ -69,7 +69,7 @@ def collect_landmarks(ws, plane=True):
     return marks
 
 
-def anchors(ws):
+def anchors(ws, smooth=None):
     data = ws.load("homographies.json")
     Hs = [np.asarray(m) for m in data["H"]]
     n = len(Hs)
@@ -109,11 +109,21 @@ def anchors(ws):
         print("too few frames constrained - skipping anchor refinement")
         return
 
-    # interpolate gaps + light temporal smoothing
+    # Interpolate gaps + light temporal smoothing. smooth=False (fit each
+    # frame's correction independently) was tried for ref-frame
+    # homographies during R1+K1 integration to cancel their per-frame
+    # registration jitter at this layer — it improved the landmark
+    # residual but INJECTED comparable per-frame fit noise of its own
+    # (~24 bbox landmarks/frame can't beat the jitter it removes; static
+    # z_v slip went 16.8 -> 19.8 px/s). Jitter is owned upstream by
+    # register.smooth_homographies; corrections stay smooth here.
     idx = np.arange(n)
+    if smooth is None:
+        smooth = True
     for c in range(6):
         corr[:, c] = np.interp(idx, idx[ok], corr[ok, c])
-        corr[:, c] = gaussian_filter1d(corr[:, c], 2.0)
+        if smooth:
+            corr[:, c] = gaussian_filter1d(corr[:, c], 2.0)
 
     out = []
     resid_before = _residual(Hs, marks, None)

@@ -48,13 +48,22 @@ def refine_correction(mosaic_gray, mosaic_mask, warp_gray, warp_mask):
     return F, int(inl.sum())
 
 
-def build(ws, step=STEP, max_dim=MAX_DIM, refine=True):
+def build(ws, step=STEP, max_dim=MAX_DIM, refine=None):
     meta = ws.meta
     w, h = meta["width"], meta["height"]
+    hom = ws.load("homographies.json")
+    if refine is None:
+        # Default ON for chained v1 homographies only. On ref-frame (R1)
+        # homographies the mosaic drift refinement re-anchors on off-deck
+        # content and "corrects" the deck registration by ~400 px — it
+        # must not run there (R1 report, pipeline notes).
+        refine = hom.get("method") != "ref-frame"
+        if not refine:
+            print("ref-frame homographies: mosaic drift refinement OFF")
     raw_path = ws.path("homographies-raw.json")
     if refine and not os.path.exists(raw_path):
         shutil.copy(ws.path("homographies.json"), raw_path)
-    Hs = [np.asarray(m) for m in ws.load("homographies.json")["H"]]
+    Hs = [np.asarray(m) for m in hom["H"]]
 
     corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)
     ones = np.ones((4, 1))
