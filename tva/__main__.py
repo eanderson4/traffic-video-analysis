@@ -11,7 +11,7 @@ def main():
     p.add_argument("src")
     p.add_argument("--work", required=True)
 
-    for name in ("stabilize", "world", "spacetime", "worldmap",
+    for name in ("stabilize", "register", "world", "spacetime", "worldmap",
                  "roads", "plate", "segment", "anchors", "speedqa"):
         p = sub.add_parser(name)
         p.add_argument("--work", required=True)
@@ -37,6 +37,10 @@ def main():
     if args.cmd == "stabilize":
         from . import stabilize
         stabilize.run(ws)
+        stabilize.qa(ws)
+    elif args.cmd == "register":
+        from . import register, stabilize
+        register.run(ws)
         stabilize.qa(ws)
     elif args.cmd == "detect":
         from . import detect
