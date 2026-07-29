@@ -33,6 +33,11 @@ def main():
     p.add_argument("--highlight", default="",
                    help="comma-separated track ids to enlarge + outline")
 
+    p = sub.add_parser("edit", help="interactive focus-lane editor "
+                                    "(click cars loud/quiet in a browser)")
+    p.add_argument("--work", required=True)
+    p.add_argument("--port", type=int, default=8123)
+
     p = sub.add_parser("detect")
     p.add_argument("--work", required=True)
     p.add_argument("--model", default="yolo11m.pt")
@@ -91,6 +96,9 @@ def main():
         from . import viz
         ids = [int(s) for s in args.tracks.split(",") if s.strip()]
         viz.speed_qa(ws, track_ids=ids or None, suffix=args.suffix)
+    elif args.cmd == "edit":
+        from . import lane_edit
+        lane_edit.run(ws, port=args.port)
     elif args.cmd == "render":
         from . import render
         layers = ("roads", "cars") if args.roads else ("cars",)

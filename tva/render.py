@@ -99,6 +99,117 @@ def focus_lane_ids(wt, roads, spec):
     return ids - set(spec.get("exclude", []))
 
 
+def hidden_ids(ws, wt, roads):
+    """Parked/scenery tracks the render never paints.
+
+    statics.json: hand-enforced known-fixed zones (parking lots, depots) in
+    world px — registration extrapolation drifts in off-plane corners, so
+    parked cars there read fake speeds no automatic static test catches.
+    Plus static-and-off-every-road culling: that "speed" is pure
+    registration noise, so they twitch with color.
+    """
+    parked = set()
+    try:
+        zones = ws.load("statics.json")["zones"]
+    except FileNotFoundError:
+        zones = []
+    if zones:
+        from matplotlib.path import Path
+        paths = [Path(z["polygon"]) for z in zones]
+        for tr in wt["tracks"]:
+            p = (np.median(tr["x"]), np.median(tr["y"]))
+            if any(pt.contains_point(p) for pt in paths):
+                parked.add(tr["id"])
+        print(f"{len(parked)} vehicles inside static zones hidden")
+    if roads:
+        from .kinematics import station_of
+        for tr in wt["tracks"]:
+            if not tr.get("static"):
+                continue
+            mx = np.array([np.median(tr["x"])])
+            my = np.array([np.median(tr["y"])])
+            dmin = min(station_of(r["x"], r["y"], mx, my)[1][0]
+                       for r in roads)
+            if dmin > 3.5 * wt["car_len_px"]:
+                parked.add(tr["id"])
+        print(f"{len(parked)} parked vehicles hidden")
+    return parked
+
+
+def manual_world(ws, Hs, fps):
+    """Hand-annotated cars from the lane editor (manual_tracks.json):
+    keyframe image-px points, linearly interpolated per frame, lifted to
+    world via the per-frame homography; speed from the smoothed world path.
+    """
+    try:
+        man = ws.load("manual_tracks.json")["tracks"]
+    except FileNotFoundError:
+        return []
+    out = []
+    for m in man:
+        pts = sorted(map(tuple, m["points"]))
+        if not pts:
+            continue
+        px = {pts[0][0]: (pts[0][1], pts[0][2])}
+        for (fa, xa, ya), (fb, xb, yb) in zip(pts, pts[1:]):
+            for f in range(fa, fb + 1):
+                t = (f - fa) / (fb - fa) if fb > fa else 0.0
+                px[f] = (xa + (xb - xa) * t, ya + (yb - ya) * t)
+        F = sorted(px)
+        w = np.array([apply_h(Hs[f], [px[f]])[0] for f in F])
+        sm = w.copy()
+        if len(w) > 7:
+            k = np.ones(7) / 7
+            sm = np.column_stack([np.convolve(w[:, i], k, "same")
+                                  for i in (0, 1)])
+            sm[:3], sm[-3:] = w[:3], w[-3:]
+        d = np.gradient(sm, axis=0) if len(w) > 1 else np.zeros_like(w)
+        sp = (np.hypot(d[:, 0], d[:, 1]) * fps).tolist()
+        out.append({"track": {"id": m["id"], "frames": F,
+                              "x": w[:, 0].tolist(), "y": w[:, 1].tolist(),
+                              "speed": sp},
+                    "id": m["id"], "px": px})
+    return out
+
+
+def lane_guide_path(wt, focus, roads, spec, car_len):
+    """World-plane centerline of the focus lane, fitted from the selected
+    cars' paths: bin their world points by station along the road, median
+    per bin, light smoothing."""
+    road = roads[spec["road"]]
+    rx, ry = np.asarray(road["x"]), np.asarray(road["y"])
+    s_cum = np.concatenate(
+        [[0], np.cumsum(np.hypot(np.diff(rx), np.diff(ry)))])
+    S, X, Y = [], [], []
+    for tr in wt["tracks"]:
+        if tr["id"] not in focus:
+            continue
+        x, y = np.asarray(tr["x"]), np.asarray(tr["y"])
+        d2 = (rx[None, :] - x[:, None]) ** 2 + (ry[None, :] - y[:, None]) ** 2
+        j = d2.argmin(axis=1)
+        S.extend(s_cum[j])
+        X.extend(x)
+        Y.extend(y)
+    if not S:
+        return None
+    S, X, Y = map(np.asarray, (S, X, Y))
+    step = car_len / 2
+    p = []
+    for b in np.arange(S.min(), S.max() + step, step):
+        sel = (S >= b) & (S < b + step)
+        if sel.sum() >= 6:
+            p.append((np.median(X[sel]), np.median(Y[sel])))
+    if len(p) < 2:
+        return None
+    p = np.asarray(p)
+    if len(p) > 8:
+        # "valid" trims the sparse noisy end bins instead of keeping them
+        k = np.ones(7) / 7
+        p = np.column_stack([np.convolve(p[:, i], k, "valid")
+                             for i in (0, 1)])
+    return p
+
+
 def neon(col):
     """Push a BGR color to full saturation/value: the focus-lane variant of
     the speed ramp (same red=stopped/green=moving semantics, louder)."""
@@ -139,43 +250,27 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
 
     # focus_lane.json: hand-picked lane whose cars get the loud styling so
     # the stop wave marching up one lane is impossible to miss
+    spec = None
     try:
-        focus = focus_lane_ids(wt, roads, ws.load("focus_lane.json"))
-        print(f"{len(focus)} vehicles in focus lane")
+        spec = ws.load("focus_lane.json")
+        focus = focus_lane_ids(wt, roads, spec) if roads else set()
     except FileNotFoundError:
         focus = set()
 
-    # statics.json: hand-enforced known-fixed zones (parking lots, depots) in
-    # world px. Registration extrapolation drifts in off-plane corners, so
-    # parked cars there read fake speeds no automatic static test catches.
-    parked = set()
-    try:
-        zones = ws.load("statics.json")["zones"]
-    except FileNotFoundError:
-        zones = []
-    if zones:
-        from matplotlib.path import Path
-        paths = [Path(z["polygon"]) for z in zones]
-        for tr in wt["tracks"]:
-            p = (np.median(tr["x"]), np.median(tr["y"]))
-            if any(pt.contains_point(p) for pt in paths):
-                parked.add(tr["id"])
-        print(f"{len(parked)} vehicles inside static zones hidden")
+    # hand-annotated cars join as full tracks, always in the focus set
+    for m in manual_world(ws, Hs, fps):
+        wt["tracks"].append(m["track"])
+        px_of[m["id"]] = m["px"]
+        size_of[m["id"]] = 80
+        focus.add(m["id"])
+    if focus:
+        print(f"{len(focus)} vehicles in focus lane")
 
-    # parked = static AND off every inferred road: don't paint them at all
-    # (their "speed" is pure registration noise, so they twitch with color)
-    if roads:
-        from .kinematics import station_of
-        for tr in wt["tracks"]:
-            if not tr.get("static"):
-                continue
-            mx = np.array([np.median(tr["x"])])
-            my = np.array([np.median(tr["y"])])
-            dmin = min(station_of(r["x"], r["y"], mx, my)[1][0]
-                       for r in roads)
-            if dmin > 3.5 * wt["car_len_px"]:
-                parked.add(tr["id"])
-        print(f"{len(parked)} parked vehicles hidden")
+    guide = None
+    if focus and roads and spec:
+        guide = lane_guide_path(wt, focus, roads, spec, car_len)
+
+    parked = hidden_ids(ws, wt, roads)
 
     # frame index -> [(track, obs index)]; fractional index = interpolated
     # frame inside a short detection dropout (dots persist through flicker)
@@ -188,9 +283,12 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
         for k, f in enumerate(F):
             if f < n:
                 per_frame[f].append((tr, float(k)))
+        # focus cars bridge any dropout (a jammed car barely moves, so the
+        # interpolation is safe); others only short flicker
+        gm = 10 ** 9 if tr["id"] in focus else gap_max
         for k in range(len(F) - 1):
             g = F[k + 1] - F[k]
-            if 1 < g <= gap_max:
+            if 1 < g <= gm:
                 for f in range(F[k] + 1, min(F[k + 1], n)):
                     per_frame[f].append((tr, k + (f - F[k]) / g))
     rings = [(ev, ev["frame"]) for ev in wt["stop_events"]]
@@ -215,6 +313,10 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
         focus_ops = []          # focus-lane draws go on top of the blend
         if roads_draw and roads:
             draw_roads(layer, roads, Hinv[i])
+        if guide is not None:   # fitted focus-lane centerline, under dots
+            g = apply_h(Hinv[i], guide).astype(np.int32)
+            cv2.polylines(layer, [g], False, (30, 30, 30), 10, cv2.LINE_AA)
+            cv2.polylines(layer, [g], False, (255, 255, 255), 4, cv2.LINE_AA)
         for tr, k in per_frame[i] if "cars" in layers else []:
             k0 = int(k)
             frac = k - k0

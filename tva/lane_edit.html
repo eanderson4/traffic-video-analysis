@@ -1,0 +1,327 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>tva focus-lane editor</title>
+<style>
+  body { margin: 0; background: #14161a; color: #cfd4dc;
+         font: 14px/1.45 system-ui, sans-serif; }
+  #wrap { max-width: 1920px; margin: 0 auto; padding: 10px 14px; }
+  #stage { position: relative; }
+  canvas { width: 100%; display: block; border-radius: 6px;
+           cursor: crosshair; }
+  #bar { display: flex; align-items: center; gap: 12px; padding: 10px 2px; }
+  #scrub { flex: 1; }
+  button { background: #2a2f3a; color: #dfe4ec; border: 1px solid #3c4454;
+           border-radius: 5px; padding: 6px 14px; font-size: 14px;
+           cursor: pointer; }
+  button:hover { background: #343b49; }
+  #save.dirty { background: #7a5c14; border-color: #b08618; }
+  #tip { position: absolute; pointer-events: none; background: #000c;
+         padding: 3px 8px; border-radius: 4px; font-size: 13px;
+         display: none; }
+  .k { color: #8a93a3; }
+  #legend span { margin-right: 16px; }
+  .dot { display: inline-block; width: 11px; height: 11px;
+         border-radius: 50%; vertical-align: -1px; margin-right: 5px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar">
+    <button id="play">&#9654;</button>
+    <input id="scrub" type="range" min="0" value="0" step="1">
+    <span id="clock" class="k" style="min-width:110px"></span>
+    <span id="counts"></span>
+    <button id="save">Save</button>
+  </div>
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="tip"></div>
+  </div>
+  <div id="legend" style="padding:8px 2px">
+    <span><span class="dot" style="background:#25d366;border:2px solid #fff">
+      </span>loud (focus lane)</span>
+    <span><span class="dot" style="background:#25d366"></span>normal</span>
+    <span><span class="dot" style="background:#4db8ff;border:2px dashed #fff">
+      </span>manual car</span>
+    <span><span class="dot" style="background:none;border:2px dashed #ff5ce8">
+      </span>detection dropout</span>
+    <br><span class="k">click a car = toggle loud &nbsp;&bull;&nbsp;
+      shift-click = place a point for a missed car (keep shift-clicking it
+      across frames; Esc = finish that car, click its dot = edit again,
+      Del = remove point at this frame) &nbsp;&bull;&nbsp;
+      hover = id + path &nbsp;&bull;&nbsp; &larr;/&rarr; step
+      (shift = &times;10) &nbsp;&bull;&nbsp; space = play &nbsp;&bull;&nbsp;
+      Ctrl-S = save</span>
+    <div class="k" id="cmd" style="padding-top:4px"></div>
+  </div>
+</div>
+<script>
+let D, scale, frame = 0, playing = false, dirty = false;
+let include = new Set(), exclude = new Set(), band = new Set();
+let byFrame = [], hoverId = null;
+let manual = [], activeM = null, nextMid = -1;
+const imgs = new Map();          // frame -> Image (browser-side cache)
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const tip = document.getElementById("tip");
+const scrub = document.getElementById("scrub");
+const saveBtn = document.getElementById("save");
+
+function isLoud(id) {
+  return include.has(id) || (band.has(id) && !exclude.has(id));
+}
+function markDirty() {
+  dirty = true;
+  saveBtn.classList.add("dirty");
+  saveBtn.textContent = "Save*";
+}
+function toggle(id) {
+  if (isLoud(id)) { include.delete(id);
+                    if (band.has(id)) exclude.add(id); }
+  else { exclude.delete(id);
+         if (!band.has(id)) include.add(id); }
+  markDirty();
+  draw();
+}
+function manualAt(m, f) {
+  const P = m.points;
+  if (!P.length || f < P[0][0] || f > P[P.length - 1][0]) return null;
+  for (let i = 0; i < P.length; i++) {
+    if (P[i][0] === f) return [P[i][1], P[i][2], true];
+    if (P[i][0] > f) {
+      const [fa, xa, ya] = P[i - 1], [fb, xb, yb] = P[i];
+      const t = (f - fa) / (fb - fa);
+      return [xa + (xb - xa) * t, ya + (yb - ya) * t, false];
+    }
+  }
+  return null;
+}
+function addManualPoint(x, y) {
+  if (!activeM) { activeM = { id: nextMid--, points: [] };
+                  manual.push(activeM); }
+  const P = activeM.points, pt = [frame, Math.round(x), Math.round(y)];
+  const i = P.findIndex(p => p[0] >= frame);
+  if (i < 0) P.push(pt);
+  else if (P[i][0] === frame) P[i] = pt;
+  else P.splice(i, 0, pt);
+  markDirty();
+  draw();
+}
+function color(v) {
+  const t = Math.max(0, Math.min(1,
+    (v - D.v_stop) / (D.v_move - D.v_stop)));
+  const lerp = (a, b) => Math.round(a + (b - a) * (t < .5 ? t * 2 : t * 2 - 1));
+  return t < .5
+    ? `rgb(${lerp(225,240)},${lerp(45,160)},${lerp(35,25)})`
+    : `rgb(${lerp(240,45)},${lerp(160,205)},${lerp(25,70)})`;
+}
+function getImg(f, cb) {
+  if (imgs.has(f)) { const im = imgs.get(f);
+                     if (im.complete) return im; return null; }
+  const im = new Image();
+  im.onload = () => { if (cb) cb(); };
+  im.src = "/frame/" + f + ".jpg";
+  imgs.set(f, im);
+  return null;
+}
+function draw() {
+  const im = getImg(frame, draw);
+  if (im) ctx.drawImage(im, 0, 0);
+  else { ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cv.width, cv.height); }
+  for (const [tr, k] of byFrame[frame]) {
+    const x = tr.x[k] * scale, y = tr.y[k] * scale;
+    const loud = isLoud(tr.id), hov = tr.id === hoverId;
+    if (hov) {                       // full path of the hovered track
+      ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      tr.x.forEach((px, j) =>
+        ctx[j ? "lineTo" : "moveTo"](px * scale, tr.y[j] * scale));
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.arc(x, y, (loud ? 11 : 6) + (hov ? 2 : 0), 0, 7);
+    ctx.fillStyle = color(tr.v[k]);
+    ctx.fill();
+    if (loud) { ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke(); }
+  }
+  // dropout ghosts: a loud track alive but not detected at this frame
+  for (const tr of D.tracks) {
+    if (!isLoud(tr.id)) continue;
+    const F = tr.f;
+    if (!F.length || frame <= F[0] || frame >= F[F.length - 1]) continue;
+    const k = F.findIndex(f => f >= frame);
+    if (F[k] === frame) continue;
+    const t = (frame - F[k - 1]) / (F[k] - F[k - 1]);
+    const x = (tr.x[k - 1] + (tr.x[k] - tr.x[k - 1]) * t) * scale;
+    const y = (tr.y[k - 1] + (tr.y[k] - tr.y[k - 1]) * t) * scale;
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = "#ff5ce8";
+    ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(x, y, 12, 0, 7); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  // manual cars: hand-annotated keyframes, dashed outline (blue = active)
+  for (const m of manual) {
+    const act = activeM && m.id === activeM.id;
+    if (act && m.points.length > 1) {
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = "#7fd7ff"; ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      m.points.forEach((q, j) =>
+        ctx[j ? "lineTo" : "moveTo"](q[1] * scale, q[2] * scale));
+      ctx.stroke(); ctx.setLineDash([]);
+    }
+    const p = manualAt(m, frame);
+    if (!p) continue;
+    ctx.beginPath(); ctx.arc(p[0] * scale, p[1] * scale, 11, 0, 7);
+    ctx.fillStyle = "#4db8ff"; ctx.fill();
+    ctx.setLineDash([4, 3]);
+    ctx.strokeStyle = act ? "#7fd7ff" : "#fff"; ctx.lineWidth = 3;
+    ctx.stroke(); ctx.setLineDash([]);
+    if (p[2]) { ctx.beginPath();                 // exact keyframe marker
+                ctx.arc(p[0] * scale, p[1] * scale, 2.5, 0, 7);
+                ctx.fillStyle = "#fff"; ctx.fill(); }
+  }
+  document.getElementById("clock").textContent =
+    "f " + frame + " / " + (D.n_frames - 1) +
+    "  t=" + (frame / D.fps).toFixed(2) + "s";
+  const loudN = new Set([...band].filter(i => !exclude.has(i)));
+  include.forEach(i => loudN.add(i));
+  document.getElementById("counts").innerHTML =
+    `<b>${loudN.size}</b> loud <span class="k">(band ${band.size}, ` +
+    `+${include.size}, &minus;${exclude.size})</span> ` +
+    `<b>${manual.length}</b> manual` +
+    (activeM ? ` <span class="k">(editing m${activeM.id}, ` +
+               `${activeM.points.length} pts)</span>` : "");
+}
+function coordsOf(ev) {
+  const r = cv.getBoundingClientRect();
+  return [(ev.clientX - r.left) * cv.width / r.width,
+          (ev.clientY - r.top) * cv.height / r.height];
+}
+function pickManual(mx, my) {
+  let best = null, bd = 20 * 20;
+  for (const m of manual) {
+    const p = manualAt(m, frame);
+    if (!p) continue;
+    const dx = p[0] * scale - mx, dy = p[1] * scale - my;
+    const d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = m; }
+  }
+  return best;
+}
+function pick(ev) {
+  const [mx, my] = coordsOf(ev);
+  let best = null, bd = 20 * 20;
+  for (const [tr, k] of byFrame[frame]) {
+    const dx = tr.x[k] * scale - mx, dy = tr.y[k] * scale - my;
+    const d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = tr; }
+  }
+  return best;
+}
+let fetchTimer = null;
+function setFrame(f) {
+  frame = Math.max(0, Math.min(D.n_frames - 1, f));
+  scrub.value = frame;
+  clearTimeout(fetchTimer);
+  if (imgs.has(frame) || playing) {
+    getImg(frame, draw);
+    if (playing) getImg(frame + 1);     // keep the pipe warm
+  } else {
+    // debounce during scrubbing: only fetch once the slider settles, so
+    // we don't queue a pile of expensive random 4K seeks server-side
+    const want = frame;
+    fetchTimer = setTimeout(() => getImg(want, draw), 60);
+  }
+  draw();
+}
+async function save() {
+  await fetch("/save", { method: "POST",
+    body: JSON.stringify({ include: [...include], exclude: [...exclude],
+      manual: manual.filter(m => m.points.length) }) });
+  dirty = false;
+  saveBtn.classList.remove("dirty");
+  saveBtn.textContent = "Saved";
+  setTimeout(() => { if (!dirty) saveBtn.textContent = "Save"; }, 1200);
+}
+
+fetch("/data").then(r => r.json()).then(d => {
+  D = d;
+  band = new Set(d.band);
+  include = new Set(d.include);
+  exclude = new Set(d.exclude);
+  manual = d.manual || [];
+  nextMid = manual.length
+    ? Math.min(-1, Math.min(...manual.map(m => m.id)) - 1) : -1;
+  cv.width = 1920;
+  cv.height = Math.round(d.height * 1920 / d.width / 2) * 2;
+  scale = 1920 / d.width;
+  scrub.max = d.n_frames - 1;
+  byFrame = Array.from({ length: d.n_frames }, () => []);
+  for (const tr of d.tracks)
+    tr.f.forEach((f, k) => { if (f < d.n_frames) byFrame[f].push([tr, k]); });
+  document.getElementById("cmd").textContent =
+    "after saving, re-render:  python3 -m tva render --work " + d.work;
+  setFrame(0);
+});
+
+scrub.oninput = () => setFrame(+scrub.value);
+cv.onclick = ev => {
+  const [mx, my] = coordsOf(ev);
+  if (ev.shiftKey) { addManualPoint(mx / scale, my / scale); return; }
+  const m = pickManual(mx, my);
+  if (m) { activeM = m; draw(); return; }
+  const t = pick(ev);
+  if (t) toggle(t.id);
+};
+cv.onmousemove = ev => {
+  const t = pick(ev);
+  hoverId = t ? t.id : null;
+  if (t) {
+    tip.style.display = "block";
+    tip.style.left = (ev.clientX - cv.getBoundingClientRect().left + 14) + "px";
+    tip.style.top = (ev.clientY - cv.getBoundingClientRect().top - 8) + "px";
+    tip.textContent = "id " + t.id + (isLoud(t.id) ? "  (loud)" : "");
+  } else tip.style.display = "none";
+  draw();
+};
+cv.onmouseleave = () => { hoverId = null; tip.style.display = "none"; draw(); };
+saveBtn.onclick = save;
+document.getElementById("play").onclick = togglePlay;
+function togglePlay() {
+  playing = !playing;
+  document.getElementById("play").innerHTML =
+    playing ? "&#10074;&#10074;" : "&#9654;";
+  if (playing) tick();
+}
+function tick() {
+  if (!playing) return;
+  if (frame >= D.n_frames - 1) { togglePlay(); return; }
+  setFrame(frame + 1);
+  setTimeout(tick, 1000 / D.fps);
+}
+document.onkeydown = ev => {
+  if (ev.key === "ArrowRight") setFrame(frame + (ev.shiftKey ? 10 : 1));
+  else if (ev.key === "ArrowLeft") setFrame(frame - (ev.shiftKey ? 10 : 1));
+  else if (ev.key === " ") { ev.preventDefault(); togglePlay(); }
+  else if (ev.key === "s" && (ev.ctrlKey || ev.metaKey)) {
+    ev.preventDefault(); save();
+  }
+  else if (ev.key === "Escape") { activeM = null; draw(); }
+  else if ((ev.key === "Delete" || ev.key === "Backspace") && activeM) {
+    const i = activeM.points.findIndex(p => p[0] === frame);
+    if (i >= 0) activeM.points.splice(i, 1);
+    if (!activeM.points.length) {
+      manual = manual.filter(m => m !== activeM);
+      activeM = null;
+    }
+    markDirty(); draw();
+  }
+};
+window.onbeforeunload = () => dirty ? "unsaved" : undefined;
+</script>
+</body>
+</html>
