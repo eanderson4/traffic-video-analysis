@@ -19,18 +19,35 @@ from .stabilize import apply_h
 MIN_RUN_S = 2.0        # stopped runs shorter than this aren't landmarks
 MIN_LANDMARKS = 10     # per frame, else correction is interpolated
 RANSAC_TOL = 5.0       # world px
+PLANE_LAT = 3.0        # x car_len: only landmarks this close to the
+                       # centerline (elevated carriageways are a different
+                       # plane than ground-level lots; mixing them leaves
+                       # parallax on the road we're analyzing)
 
 
-def collect_landmarks(ws):
+def collect_landmarks(ws, plane=True):
     """[(world xy, {frame: pixel xy})] for static tracks and long stopped
-    runs."""
+    runs. With plane=True, restricted to the centerline's roadway."""
     wt = ws.load("world_tracks.json")
     fps = ws.meta["fps"]
+    cl = None
+    if plane:
+        try:
+            cl = ws.load("centerline.json")
+        except FileNotFoundError:
+            print("no centerline.json - anchoring on all landmarks")
     px_of = {}
     for tr in ws.load("tracks.json")["tracks"]:
         px_of[tr["id"]] = {o[0]: (o[1], o[2]) for o in tr["obs"]}
     marks = []
     for tr in wt["tracks"]:
+        if cl is not None:
+            from .kinematics import station_of
+            mx = np.array([float(np.median(tr["x"]))])
+            my = np.array([float(np.median(tr["y"]))])
+            _, lat = station_of(cl["x"], cl["y"], mx, my)
+            if lat[0] > PLANE_LAT * wt["car_len_px"]:
+                continue
         obs = px_of.get(tr["id"], {})
         spans = []
         if tr["static"]:
@@ -57,6 +74,9 @@ def anchors(ws):
     Hs = [np.asarray(m) for m in data["H"]]
     n = len(Hs)
     marks = collect_landmarks(ws)
+    if len(marks) < 3 * MIN_LANDMARKS:
+        print(f"only {len(marks)} on-plane landmarks - falling back to all")
+        marks = collect_landmarks(ws, plane=False)
     print(f"{len(marks)} static landmarks")
 
     # per-frame affine corrections (world coords), NaN where underconstrained

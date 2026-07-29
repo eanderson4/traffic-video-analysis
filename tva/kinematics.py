@@ -4,11 +4,17 @@ classify moving/stopped, extract stop-onset events, derive a road centerline.
 All positions are reference-plane pixels (frame 0's ground plane), so a
 stopped car is a fixed point regardless of camera motion. Speeds are px/s in
 that plane; attach a physical scale later (lane width / car length).
+
+Speeds come from a constant-acceleration Kalman filter + RTS smoother per
+track, not from differentiating positions: bbox-center jitter and residual
+projection noise turn finite differences into sinusoidal garbage, while the
+acceleration prior only admits speed profiles a real car could drive. The
+smoother is two-pass (uses future observations), so stop onsets are sharp
+rather than lagged.
 """
 import math
 
 import numpy as np
-from scipy.signal import savgol_filter
 
 from .stabilize import apply_h
 
@@ -16,13 +22,94 @@ MIN_TRACK_FRAMES = 12          # drop blips
 STOP_SPEED_FRAC = 0.10         # stopped if speed < frac * median car length /s
 MOVE_SPEED_FRAC = 0.22         # hysteresis: moving again above this
 MIN_STATE_RUN_S = 0.4          # ignore state flickers shorter than this
+SIGMA_MEAS_FRAC = 0.04         # position noise, frac of car_len (bbox jitter)
+SIGMA_JERK_FRAC = 1.0          # white-jerk process intensity, frac of car_len
 
 
-def smooth(a, fps):
-    win = max(5, int(round(fps * 0.6)) | 1)
-    if len(a) < win:
-        return np.asarray(a, dtype=float)
-    return savgol_filter(a, win, 2)
+def _rts_1d(t, z, sig_meas, sig_jerk):
+    """1-D constant-acceleration Kalman filter + RTS smoother.
+
+    State [pos, vel, acc]; measurement = pos. sig_meas is per-sample (array).
+    Returns smoothed (pos, vel). Handles irregular dt (gappy tracks).
+    """
+    n = len(z)
+    q, R = sig_jerk ** 2, np.asarray(sig_meas) ** 2
+    xf = np.zeros((n, 3))
+    Pf = np.zeros((n, 3, 3))
+    xp = np.zeros((n, 3))
+    Pp = np.zeros((n, 3, 3))
+    Fs = np.zeros((n, 3, 3))
+    x = np.array([z[0], 0.0, 0.0])
+    s0 = float(np.median(np.sqrt(R)))
+    P = np.diag([R[0], (50 * s0) ** 2, (50 * s0) ** 2])
+    for k in range(n):
+        if k > 0:
+            dt = t[k] - t[k - 1]
+            F = np.array([[1, dt, dt * dt / 2], [0, 1, dt], [0, 0, 1]])
+            Q = q * np.array(
+                [[dt ** 5 / 20, dt ** 4 / 8, dt ** 3 / 6],
+                 [dt ** 4 / 8, dt ** 3 / 3, dt ** 2 / 2],
+                 [dt ** 3 / 6, dt ** 2 / 2, dt]])
+            x = F @ x
+            P = F @ P @ F.T + Q
+        else:
+            F = np.eye(3)
+        xp[k], Pp[k], Fs[k] = x, P, F
+        K = P[:, 0] / (P[0, 0] + R[k])
+        x = x + K * (z[k] - x[0])
+        P = P - np.outer(K, P[0, :])
+        xf[k], Pf[k] = x, P
+    xs = xf.copy()
+    for k in range(n - 2, -1, -1):
+        C = Pf[k] @ Fs[k + 1].T @ np.linalg.inv(Pp[k + 1])
+        xs[k] = xf[k] + C @ (xs[k + 1] - xp[k + 1])
+    return xs[:, 0], xs[:, 1]
+
+
+def _local_sigma(t, res, floor, win_s=0.5):
+    """Per-sample noise scale: median |residual| in a +/-win_s window."""
+    out = np.empty(len(res))
+    for k in range(len(res)):
+        a = np.searchsorted(t, t[k] - win_s)
+        b = np.searchsorted(t, t[k] + win_s, side="right")
+        out[k] = max(floor, float(np.median(res[a:b])))
+    return out
+
+
+def smooth_track(t, pts, car_len, jac_scale=None):
+    """Smoothed positions and velocities for an (n,2) world-point array.
+
+    Measurement noise is adaptive twice over: jac_scale (local world-px per
+    image-px of the homography) inflates it where the projection amplifies —
+    near-horizon geometry during aggressive camera moves turns 1px of bbox
+    jitter into 10+ world px — and a second pass re-weights by each
+    segment's actual residuals, so motion-blurred moving cars are trusted
+    less than pin-sharp stopped ones instead of everything sharing one
+    global sigma.
+    """
+    sm = SIGMA_MEAS_FRAC * car_len
+    sj = SIGMA_JERK_FRAC * car_len
+    sig = np.full(len(t), sm)
+    if jac_scale is not None:
+        sig = sm * np.maximum(np.asarray(jac_scale), 1.0)
+
+    def run_pass(sig_arr):
+        xs, vx = _rts_1d(t, pts[:, 0], sig_arr, sj)
+        ys, vy = _rts_1d(t, pts[:, 1], sig_arr, sj)
+        return xs, ys, vx, vy
+
+    xs, ys, vx, vy = run_pass(sig)
+    res = np.hypot(pts[:, 0] - xs, pts[:, 1] - ys)
+    sig = np.maximum(sig, _local_sigma(t, res, sm))
+    return run_pass(sig)
+
+
+def jacobian_scale(H, p, eps=2.0):
+    """Local world-px per image-px of homography H at image point p."""
+    q0 = apply_h(H, [p])[0]
+    qx = apply_h(H, [(p[0] + eps, p[1])])[0]
+    qy = apply_h(H, [(p[0], p[1] + eps)])[0]
+    return float((np.hypot(*(qx - q0)) + np.hypot(*(qy - q0))) / (2 * eps))
 
 
 def state_runs(stopped, fps):
@@ -79,11 +166,10 @@ def run(ws):
         frames = [o[0] for o in obs]
         pts = np.array([apply_h(Hs[f], [(cx, cy)])[0]
                         for f, cx, cy, *_ in obs])
-        xs, ys = smooth(pts[:, 0], fps), smooth(pts[:, 1], fps)
-        # central-difference speed on the (possibly gappy) frame index
         t = np.array(frames) / fps
-        vx = np.gradient(xs, t)
-        vy = np.gradient(ys, t)
+        jac = np.array([jacobian_scale(Hs[f], (cx, cy))
+                        for f, cx, cy, *_ in obs])
+        xs, ys, vx, vy = smooth_track(t, pts, car_len, jac_scale=jac)
         speed = np.hypot(vx, vy)
 
         # hysteresis state machine
@@ -108,9 +194,14 @@ def run(ws):
             dur = (frames[pb] - frames[pa]) / fps
             if path < 2.0 * car_len or dur < 0.8:
                 continue
+            # sub-frame onset: interpolate the v_stop crossing
+            t_on = t[a]
+            if a > 0 and speed[a - 1] > v_stop > speed[a]:
+                frac = (speed[a - 1] - v_stop) / (speed[a - 1] - speed[a])
+                t_on = t[a - 1] + frac * (t[a] - t[a - 1])
             stop_events.append({
                 "track": tr["id"], "frame": frames[a],
-                "t": round(frames[a] / fps, 2),
+                "t": round(float(t_on), 3),
                 "x": round(float(xs[a]), 1), "y": round(float(ys[a]), 1),
             })
         # static = parked or gridlocked the whole time we saw it: barely any

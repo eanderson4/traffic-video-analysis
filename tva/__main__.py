@@ -11,10 +11,17 @@ def main():
     p.add_argument("src")
     p.add_argument("--work", required=True)
 
-    for name in ("stabilize", "world", "spacetime", "worldmap", "render",
-                 "roads", "plate", "segment", "anchors"):
+    for name in ("stabilize", "world", "spacetime", "worldmap",
+                 "roads", "plate", "segment", "anchors", "speedqa"):
         p = sub.add_parser(name)
         p.add_argument("--work", required=True)
+
+    p = sub.add_parser("render")
+    p.add_argument("--work", required=True)
+    p.add_argument("--roads", action="store_true",
+                   help="draw inferred road/lane overlay (off by default)")
+    p.add_argument("--highlight", default="",
+                   help="comma-separated track ids to enlarge + outline")
 
     p = sub.add_parser("detect")
     p.add_argument("--work", required=True)
@@ -56,9 +63,14 @@ def main():
     elif args.cmd == "segment":
         from . import segment
         segment.run(ws)
+    elif args.cmd == "speedqa":
+        from . import viz
+        viz.speed_qa(ws)
     elif args.cmd == "render":
         from . import render
-        render.run(ws)
+        layers = ("roads", "cars") if args.roads else ("cars",)
+        hot = {int(s) for s in args.highlight.split(",") if s.strip()}
+        render.run(ws, layers=layers, highlight=hot)
 
 
 if __name__ == "__main__":

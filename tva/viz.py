@@ -76,6 +76,59 @@ def spacetime(ws, out_w=1400, out_h=1000):
     print(f"wrote {out}")
 
 
+def speed_qa(ws, n_tracks=10):
+    """Raw vs smoothed speed profiles for tracks with stop events.
+
+    Grey = central-difference speed of the raw projected bbox centers (what
+    the smoother has to work with); color = the smoothed speed we publish.
+    If the color curve still wiggles like the grey one, the smoother is too
+    loose; if it lags the stop, too stiff.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from .stabilize import apply_h
+
+    fps = ws.meta["fps"]
+    Hs = [np.asarray(h) for h in ws.load("homographies.json")["H"]]
+    wt = ws.load("world_tracks.json")
+    v_stop, v_move = wt["v_stop"], wt["v_move"]
+    ev_of = {}
+    for ev in wt["stop_events"]:
+        ev_of.setdefault(ev["track"], []).append(ev["t"])
+    raw_obs = {tr["id"]: tr["obs"] for tr in ws.load("tracks.json")["tracks"]}
+
+    picks = sorted((tr for tr in wt["tracks"] if tr["id"] in ev_of),
+                   key=lambda tr: -len(tr["frames"]))[:n_tracks]
+    fig, axes = plt.subplots(len(picks), 1, figsize=(12, 2.1 * len(picks)),
+                             sharex=True)
+    for ax, tr in zip(np.atleast_1d(axes), picks):
+        obs = [o for o in raw_obs[tr["id"]] if o[0] < len(Hs)]
+        t_raw = np.array([o[0] for o in obs]) / fps
+        pts = np.array([apply_h(Hs[o[0]], [(o[1], o[2])])[0] for o in obs])
+        v_raw = np.hypot(np.gradient(pts[:, 0], t_raw),
+                         np.gradient(pts[:, 1], t_raw))
+        t_sm = np.array(tr["frames"]) / fps
+        ax.plot(t_raw, v_raw, color="0.65", lw=1, label="raw diff")
+        ax.plot(t_sm, tr["speed"], color="#2e5bff", lw=2, label="smoothed")
+        ax.axhline(v_stop, color="#eb3c32", lw=0.8, ls="--")
+        ax.axhline(v_move, color="#3cc85a", lw=0.8, ls="--")
+        for te in ev_of[tr["id"]]:
+            ax.axvline(te, color="#eb3c32", lw=1.2)
+        ax.set_ylabel(f"tr {tr['id']}", fontsize=8)
+        ax.set_ylim(0, max(np.percentile(v_raw, 98), 3 * v_move))
+    np.atleast_1d(axes)[0].legend(loc="upper right", fontsize=8)
+    np.atleast_1d(axes)[-1].set_xlabel("t (s)")
+    fig.suptitle("speed profiles: raw central-diff vs published (px/s); "
+                 "red vline = stop onset", fontsize=10)
+    fig.tight_layout()
+    out = f"{ws.qa}/speed-profiles.png"
+    fig.savefig(out, dpi=110)
+    plt.close(fig)
+    print(f"wrote {out}")
+
+
 def world_map(ws):
     """All world tracks + centerline + stop events on one canvas."""
     wt = ws.load("world_tracks.json")

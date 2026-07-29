@@ -17,8 +17,12 @@ motion is exactly a per-frame **homography**. So the pipeline is:
    per-frame boxes with persistent ids.
 3. **World kinematics** — map every detection through its frame's homography
    into the reference plane. Camera pan/rotation cancels: a stopped car is a
-   fixed world point. Per-track smoothed speed → moving/stopped state →
-   stop-onset events (the jam wave front, measured).
+   fixed world point. Speeds come from a constant-acceleration Kalman
+   filter + RTS smoother per track (velocity is a state, never a finite
+   difference), with per-observation measurement noise scaled by the local
+   homography Jacobian (projective amplification) and re-weighted from each
+   segment's residuals (motion blur). Moving/stopped hysteresis →
+   stop-onset events with sub-frame timing (the jam wave front, measured).
 4. **Road model** — centerline in the reference plane (derived from vehicle
    trajectories, refinable by hand annotation) gives a station coordinate
    `s` = arc length along the road. Car state becomes 1-D: `s(t)`.
@@ -50,8 +54,17 @@ python -m tva stabilize --work <dir>            # cv2 only
 python -m tva detect --work <dir> --model weights/visdrone-yolov8x.pt --imgsz 1920
 python -m tva world --work <dir>
 python -m tva spacetime --work <dir>            # space-time diagram PNG
+python -m tva speedqa --work <dir>              # raw vs smoothed speed profiles
 python -m tva render --work <dir>               # speed-colored overlay video
+python -m tva render --work <dir> --roads --highlight 33,49   # optional layers
 ```
+
+`render` draws cars only by default (`--roads` adds the inferred road/lane
+overlay; `--highlight` enlarges + outlines specific track ids for
+storytelling). `anchors` re-registers each frame against provably-static
+vehicles near the analysis centerline — same-plane landmarks, because an
+elevated carriageway parallax-shifts against the ground plane whenever the
+camera translates.
 
 **Model choice matters.** COCO-trained YOLO (yolo11m etc.) is near-blind to
 nadir/top-down aerial vehicles (4 detections on a frame where VisDrone

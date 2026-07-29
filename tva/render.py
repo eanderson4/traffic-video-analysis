@@ -70,7 +70,7 @@ def draw_roads(layer, roads, Hinv_i):
             cv2.polylines(layer, [fpts], False, col, 3, cv2.LINE_AA)
 
 
-def run(ws, out=None, out_w=1920, layers=("roads", "cars")):
+def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
     meta = ws.meta
     fps, n = meta["fps"], meta["n_frames"]
     w, h = meta["width"], meta["height"]
@@ -140,7 +140,10 @@ def run(ws, out=None, out_w=1920, layers=("roads", "cars")):
         for tr, k in per_frame[i] if "cars" in layers else []:
             v = tr["speed"][k]
             col = speed_color(v, v_stop, v_move)[::-1]  # RGB -> BGR
+            hot = tr["id"] in highlight
             r = max(6, int(0.30 * size_of.get(tr["id"], 80)))
+            if hot:
+                r = int(r * 1.8)
             # world path over the last TRAIL_S, drawn in this frame's view
             j0 = max(0, k - trail_n)
             wpts = np.column_stack([tr["x"][j0:k + 1], tr["y"][j0:k + 1]])
@@ -148,6 +151,9 @@ def run(ws, out=None, out_w=1920, layers=("roads", "cars")):
             if len(fpts) > 1:
                 cv2.polylines(layer, [fpts], False, col, max(2, r // 4),
                               cv2.LINE_AA)
+            if hot:
+                cv2.circle(layer, tuple(fpts[-1]), r + 4, (255, 255, 255),
+                           3, cv2.LINE_AA)
             cv2.circle(layer, tuple(fpts[-1]), r, col, -1, cv2.LINE_AA)
         for ev, f0 in rings:
             if f0 <= i < f0 + ring_n:
