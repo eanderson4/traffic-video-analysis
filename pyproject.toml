@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "traffic-video-analysis"
+version = "0.1.0"
+description = "Traffic footage analysis: stabilization, vehicle tracking, road-frame kinematics, overlays"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "scipy",
+    "pillow",
+    "ultralytics",
+]
+
+[tool.setuptools]
+packages = ["tva"]

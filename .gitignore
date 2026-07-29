@@ -1,0 +1,7 @@
+__pycache__/
+*.egg-info/
+*.pt
+*.mp4
+*.mov
+work/
+.venv/
