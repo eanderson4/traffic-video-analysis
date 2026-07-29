@@ -48,6 +48,9 @@ def spacetime(ws, out_w=1400, out_h=1000):
         s, lat = station_of(cl["x"], cl["y"], px, py)
         if np.median(lat) > max_lat:
             continue
+        # drop opposite-direction traffic (net motion against the spine)
+        if s[-1] - s[0] < -wt["car_len_px"]:
+            continue
         kept += 1
         ts = np.array(tr["frames"]) / fps
         for i in range(len(ts) - 1):

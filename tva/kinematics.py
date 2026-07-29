@@ -120,18 +120,32 @@ def run(ws):
 
 
 def centerline(ws):
-    """Road spine from vehicle motion: longest-path track, smoothed.
-
-    v1 heuristic — refine by hand in the annotator when it matters. Station
-    s = arc length (px) along this polyline via nearest-point projection.
+    """Road spine from vehicle motion: the track that covers the most
+    stop-onset events (i.e. runs the length of the jammed carriageway),
+    longest path as tiebreak. Without stop events, plain longest path —
+    which can easily pick a free-flowing road elsewhere in frame, so refine
+    by hand in the annotator when it matters. Station s = arc length (px)
+    along this polyline via nearest-point projection.
     """
     data = ws.load("world_tracks.json")
-    best, best_len = None, 0.0
+    events = data["stop_events"]
+    lat_tol = 2.0 * data["car_len_px"]
+    ex = np.array([e["x"] for e in events])
+    ey = np.array([e["y"] for e in events])
+    best, best_key = None, (-1, 0.0)
     for tr in data["tracks"]:
         xs, ys = np.array(tr["x"]), np.array(tr["y"])
         d = float(np.hypot(np.diff(xs), np.diff(ys)).sum())
-        if d > best_len:
-            best, best_len = tr, d
+        covered = 0
+        if len(events) and d > 3 * data["car_len_px"]:
+            _, lat = station_of(xs, ys, ex, ey)
+            covered = int((lat < lat_tol).sum())
+        if (covered, d) > best_key:
+            best, best_key = tr, (covered, d)
+    best_len = best_key[1]
+    if best is not None and len(events):
+        print(f"spine track {best['id']}: covers {best_key[0]}/{len(events)}"
+              " stop events")
     if best is None:
         print("no tracks for centerline")
         return
