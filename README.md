@@ -47,10 +47,20 @@ every stage is inspectable and cacheable:
 ```bash
 python -m tva init <video> --work <dir>
 python -m tva stabilize --work <dir>            # cv2 only
-python -m tva detect --work <dir> --model yolo11m.pt --imgsz 3840
+python -m tva detect --work <dir> --model weights/visdrone-yolov8x.pt --imgsz 1920
 python -m tva world --work <dir>
 python -m tva spacetime --work <dir>            # space-time diagram PNG
+python -m tva render --work <dir>               # speed-colored overlay video
 ```
+
+**Model choice matters.** COCO-trained YOLO (yolo11m etc.) is near-blind to
+nadir/top-down aerial vehicles (4 detections on a frame where VisDrone
+weights find ~170; tiling does not help — it's a domain gap, not a scale
+problem). For drone footage use VisDrone-trained weights:
+`weights/visdrone-yolov8x.pt`, from
+https://huggingface.co/mshamrai/yolov8x-visdrone (not committed; re-download
+if missing). `detect` picks vehicle classes by name so COCO and VisDrone
+models both work unmodified.
 
 See `examples/hero-wave.md` for the EP-03 phantom-jam run.
 

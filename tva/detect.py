@@ -6,9 +6,11 @@ downstream kinematics needs identity over time.
 """
 from collections import defaultdict
 
-# COCO vehicle classes
-VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck
-CLASS_NAMES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
+# vehicle classes are picked from the model's own class names, so COCO
+# (car/motorcycle/bus/truck) and VisDrone (car/van/truck/bus/motor) both work.
+# COCO models are near-blind to nadir/top-down aerial cars — for drone
+# footage use VisDrone weights (see README).
+VEHICLE_NAMES = {"car", "van", "truck", "bus", "motorcycle", "motor"}
 
 
 def run(ws, model="yolo11m.pt", imgsz=3840, conf=0.25):
@@ -16,11 +18,14 @@ def run(ws, model="yolo11m.pt", imgsz=3840, conf=0.25):
 
     meta = ws.meta
     yolo = YOLO(model)
+    class_ids = [i for i, n in yolo.names.items() if n in VEHICLE_NAMES]
+    class_names = {i: yolo.names[i] for i in class_ids}
+    print(f"vehicle classes: {class_names}")
     tracks = defaultdict(lambda: {"cls": None, "obs": []})
     n = 0
     for i, r in enumerate(yolo.track(
             source=meta["src"], imgsz=imgsz, conf=conf,
-            classes=VEHICLE_CLASSES, tracker="bytetrack.yaml",
+            classes=class_ids, tracker="bytetrack.yaml",
             stream=True, verbose=False)):
         b = r.boxes
         if b is not None and b.id is not None:
@@ -30,7 +35,7 @@ def run(ws, model="yolo11m.pt", imgsz=3840, conf=0.25):
             confs = b.conf.tolist()
             for tid, (cx, cy, w, h), c, cf in zip(ids, xywh, clss, confs):
                 tr = tracks[tid]
-                tr["cls"] = CLASS_NAMES.get(c, str(c))
+                tr["cls"] = class_names.get(c, str(c))
                 tr["obs"].append([i, round(cx, 1), round(cy, 1),
                                   round(w, 1), round(h, 1), round(cf, 3)])
             n += len(ids)

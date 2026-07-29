@@ -11,7 +11,7 @@ def main():
     p.add_argument("src")
     p.add_argument("--work", required=True)
 
-    for name in ("stabilize", "world", "spacetime", "worldmap"):
+    for name in ("stabilize", "world", "spacetime", "worldmap", "render"):
         p = sub.add_parser(name)
         p.add_argument("--work", required=True)
 
@@ -43,6 +43,9 @@ def main():
     elif args.cmd == "worldmap":
         from . import viz
         viz.world_map(ws)
+    elif args.cmd == "render":
+        from . import render
+        render.run(ws)
 
 
 if __name__ == "__main__":

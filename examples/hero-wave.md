@@ -9,11 +9,17 @@ Work dir lives in the episode repo so artifacts version with the episode:
 WORK=~/grove/math-vs-vibes/promo/ep-03/phantom-jam-short/work/hero-wave/tva
 python3 -m tva init ~/grove/math-vs-vibes/promo/ep-03/phantom-jam-short/footage/envato-hero-highway-jam-aerial-4k.mov --work $WORK
 python3 -m tva stabilize --work $WORK
-python3 -m tva detect --work $WORK          # yolo11m, imgsz 3840
+python3 -m tva detect --work $WORK --model weights/visdrone-yolov8x.pt --imgsz 1920
 python3 -m tva world --work $WORK
 python3 -m tva spacetime --work $WORK
 python3 -m tva worldmap --work $WORK
+python3 -m tva render --work $WORK          # -> $WORK/overlay-speed.mp4
 ```
+
+Numbers from the VisDrone run: 1541 tracks / 94,486 observations
+(~170–300 vehicles per frame), 726 world tracks, 154 stop-onset events.
+COCO yolo11m managed only a third of that and lost the clip's final 5 s
+entirely (near-vertical view).
 
 Notes:
 
