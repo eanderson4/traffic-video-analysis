@@ -251,7 +251,8 @@ def stitch_focus(wt, focus, gf, car_len, fps, px_of, exclude, parked):
     by_id = {tr["id"]: tr for tr in wt["tracks"]}
     max_gap = int(STITCH_GAP_S * fps)
     used = set()
-    for fid in sorted(focus, key=lambda t: by_id[t]["frames"][0]):
+    for fid in sorted(focus & set(by_id),
+                      key=lambda t: by_id[t]["frames"][0]):
         if fid < 0 or fid in used or fid not in focus:
             continue
         tr = by_id[fid]

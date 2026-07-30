@@ -11,8 +11,11 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
+import numpy as np
 
-from .render import focus_lane_ids, hidden_ids
+from .render import (backfill_focus, focus_lane_ids, guide_frame,
+                     hidden_ids, lane_guide_path, manual_world,
+                     stitch_focus)
 
 VIEW_W = 1920  # frames served to the browser at this width
 
@@ -37,9 +40,35 @@ def build_data(ws):
     px_of = {}
     for tr in ws.load("tracks.json")["tracks"]:
         px_of[tr["id"]] = {o[0]: (o[1], o[2]) for o in tr["obs"]}
+
+    # mirror the render's recovery pass (fragment stitching + queued-car
+    # backfill) so the editor shows exactly the dots the render will draw;
+    # backfilled frames are tagged so the client styles them apart
+    first_real = {}
+    if roads:
+        focus = focus_lane_ids(wt, roads, spec)
+        Hs = [np.asarray(m) for m in ws.load("homographies.json")["H"]]
+        for m in manual_world(ws, Hs, meta["fps"]):
+            wt["tracks"].append(m["track"])
+            px_of[m["id"]] = m["px"]
+            focus.add(m["id"])
+        guide = (lane_guide_path(wt, focus, roads, spec, wt["car_len_px"])
+                 if focus else None)
+        if guide is not None:
+            stitch_focus(wt, focus, guide_frame(guide), wt["car_len_px"],
+                         meta["fps"], px_of,
+                         set(spec.get("exclude", [])), hidden)
+            for tr in wt["tracks"]:
+                if tr["id"] in focus:
+                    first_real[tr["id"]] = tr["frames"][0]
+            Hinv = [np.linalg.inv(m) for m in Hs]
+            backfill_focus(wt, focus, wt["car_len_px"], wt["v_stop"],
+                           px_of, Hinv, (meta["width"], meta["height"]),
+                           set(spec.get("no_backfill", [])))
+
     tracks = []
     for tr in wt["tracks"]:
-        if tr["id"] in hidden:
+        if tr["id"] in hidden or tr["id"] < 0:
             continue
         F, X, Y, V = [], [], [], []
         for k, f in enumerate(tr["frames"]):
@@ -51,7 +80,11 @@ def build_data(ws):
             Y.append(round(p[1]))
             V.append(round(tr["speed"][k], 1))
         if F:
-            tracks.append({"id": tr["id"], "f": F, "x": X, "y": Y, "v": V})
+            t = {"id": tr["id"], "f": F, "x": X, "y": Y, "v": V}
+            bf = first_real.get(tr["id"])
+            if bf is not None and F[0] < bf:
+                t["bf"] = bf
+            tracks.append(t)
     try:
         man = ws.load("manual_tracks.json")["tracks"]
     except FileNotFoundError:

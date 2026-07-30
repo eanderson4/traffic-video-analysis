@@ -47,6 +47,8 @@
       </span>manual car</span>
     <span><span class="dot" style="background:none;border:2px dashed #ff5ce8">
       </span>detection dropout</span>
+    <span><span class="dot" style="background:#25d36688;border:2px dashed #fff">
+      </span>backfilled (render-added, held position)</span>
     <br><span class="k">click a car = toggle loud &nbsp;&bull;&nbsp;
       shift-click = place a point for a missed car (keep shift-clicking it
       across frames; Esc = finish that car, click its dot = edit again,
@@ -140,11 +142,16 @@ function draw() {
         ctx[j ? "lineTo" : "moveTo"](px * scale, tr.y[j] * scale));
       ctx.stroke();
     }
+    const syn = tr.bf !== undefined && tr.f[k] < tr.bf;
     ctx.beginPath();
     ctx.arc(x, y, (loud ? 11 : 6) + (hov ? 2 : 0), 0, 7);
+    ctx.globalAlpha = syn ? 0.55 : 1;
     ctx.fillStyle = color(tr.v[k]);
     ctx.fill();
-    if (loud) { ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke(); }
+    ctx.globalAlpha = 1;
+    if (loud) { if (syn) ctx.setLineDash([5, 4]);
+                ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
+                ctx.setLineDash([]); }
   }
   // dropout ghosts: a loud track alive but not detected at this frame
   for (const tr of D.tracks) {
@@ -284,7 +291,8 @@ cv.onmousemove = ev => {
     tip.style.display = "block";
     tip.style.left = (ev.clientX - cv.getBoundingClientRect().left + 14) + "px";
     tip.style.top = (ev.clientY - cv.getBoundingClientRect().top - 8) + "px";
-    tip.textContent = "id " + t.id + (isLoud(t.id) ? "  (loud)" : "");
+    tip.textContent = "id " + t.id + (isLoud(t.id) ? "  (loud)" : "") +
+      (t.bf !== undefined && frame < t.bf ? "  (backfilled)" : "");
   } else tip.style.display = "none";
   draw();
 };
