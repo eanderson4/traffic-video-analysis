@@ -22,15 +22,15 @@ R_MAX = 40             # marker radius cap (src-frame px)
 TRAIL_MIN_LEN = 0.5    # car_len; shorter world paths draw no trail
 TRAIL_STRAIGHT = 0.8   # net/path ratio below this = registration curl
                        # (a real 90-degree turn over TRAIL_S is ~0.90)
-FOCUS_DOT_R = 34       # focus-lane marker radius (src-frame px), uniform:
+FOCUS_DOT_R = 29       # focus-lane marker radius (src-frame px), uniform:
                        # state/color is the story, not apparent vehicle size
 FOCUS_RING_W = 5       # focus-lane white outline thickness
 FOCUS_ALPHA = 0.75     # loud-dot opacity: the vehicle stays visible under it
 CORRIDOR_HW = 48       # focus-lane corridor minimum half-width (world px)
-CORRIDOR_PAD = 40      # corridor clearance beyond the outermost dot centers
+CORRIDOR_PAD = 15      # corridor clearance beyond the outermost dot centers:
+                       # edges hug the loud-dot envelope, minimal dead space
 CORRIDOR_EXT = 2500    # end extension so the edges always exit the frame
 CORRIDOR_DIM = 0.55    # brightness outside the corridor (1.0 = no dim)
-CORRIDOR_TIGHT = 0.93  # pull the edge lines in toward the dots (<1 = tighter)
 STITCH_GAP_S = 8       # max dropout when chaining early fragments
 BACKFILL_V = 1.5       # x v_stop: "already stopped at first detection"
 STOP_ENTER = 1.0       # x v_stop: candidate stopped below this
@@ -514,10 +514,8 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
              for tr in wt["tracks"] if tr["id"] in focus])
         corridor = lane_corridor(
             guide,
-            CORRIDOR_TIGHT * min(-CORRIDOR_HW,
-                                 np.percentile(offs, 1) - CORRIDOR_PAD),
-            CORRIDOR_TIGHT * max(CORRIDOR_HW,
-                                 np.percentile(offs, 99) + CORRIDOR_PAD))
+            min(-CORRIDOR_HW, np.percentile(offs, 1) - CORRIDOR_PAD),
+            max(CORRIDOR_HW, np.percentile(offs, 99) + CORRIDOR_PAD))
     if focus:
         print(f"{len(focus)} vehicles in focus lane")
         # quantize each focus car to rolling/braking/stopped AFTER the
