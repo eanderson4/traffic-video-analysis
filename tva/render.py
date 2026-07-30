@@ -34,12 +34,10 @@ CORRIDOR_DIM = 0.55    # brightness outside the corridor (1.0 = no dim)
 STITCH_GAP_S = 8       # max dropout when chaining early fragments
 BACKFILL_V = 1.5       # x v_stop: "already stopped at first detection"
 STOP_ENTER = 1.0       # x v_stop: candidate stopped below this
+STOP_EXIT = 1.8        # x v_stop: leave stopped only above this, sustained
 BRAKE_ENTER = 1.7      # x v_move: candidate braking below this
 BRAKE_EXIT = 2.2       # x v_move: back to rolling only above this
 STATE_DEB_S = 0.2      # a new state must hold this long to commit
-GO_DEB_S = 0.5         # leaving stopped needs this long above BRAKE_EXIT:
-                       # queue creep tops out ~1.6x v_move, genuine
-                       # restarts sustain >2.6x v_move — no amber exit
 POP_S = 0.4            # dot pop duration when a focus car commits to stopped
 POP_SCALE = 1.4        # peak pop radius multiplier
 # quantized focus-lane states; RGB matching the continuous ramp's anchors
@@ -412,19 +410,17 @@ def focus_states(speed, fps, v_stop, v_move):
     measurement noise; the wave wants crisp hand-offs. Hysteresis bands
     (enter vs exit thresholds off v_stop/v_move) plus a debounce (the
     candidate state must hold STATE_DEB_S) make each car flip to solid red
-    once, crisply. Leaving stopped is deliberately hard: red exits only
-    directly to green, sustained above BRAKE_EXIT for GO_DEB_S — queue
-    creep from registration noise (~1.6x v_move) never gets out, a car
-    genuinely driving away does. Returns (state per sample, sample indices
-    where the state commits to stopped)."""
-    s_in = STOP_ENTER * v_stop
+    once, crisply, and not flicker back. Symmetric both ways: a car that
+    rolls again walks back amber then green. Returns (state per sample,
+    sample indices where the state commits to stopped)."""
+    s_in, s_out = STOP_ENTER * v_stop, STOP_EXIT * v_stop
     b_in, b_out = BRAKE_ENTER * v_move, BRAKE_EXIT * v_move
     deb = max(1, int(STATE_DEB_S * fps))
-    go_deb = max(1, int(GO_DEB_S * fps))
 
     def classify(v, st):
         if st == "stopped":
-            return "rolling" if v > b_out else st
+            return st if v <= s_out else (
+                "braking" if v <= b_out else "rolling")
         if st == "braking":
             return "stopped" if v < s_in else (
                 st if v <= b_out else "rolling")
@@ -443,7 +439,7 @@ def focus_states(speed, fps, v_stop, v_move):
             pend, cnt = None, 0
         elif tgt == pend:
             cnt += 1
-            if cnt >= (go_deb if st == "stopped" else deb):
+            if cnt >= deb:
                 if tgt == "stopped":
                     flips.append(len(states))
                 st, pend, cnt = tgt, None, 0
