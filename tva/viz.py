@@ -84,6 +84,7 @@ def _focus_rows(ws, monotonic_wave=False):
     overlay draws. Returns (meta, rows, s_lo, s_hi) with rows =
     (track, station array, states, flip sample indices) per focus car.
     """
+    from . import overrides
     from .render import (backfill_focus, focus_lane_ids, focus_states,
                          guide_frame, hidden_ids, lane_guide_path,
                          locate_on_guide, manual_world, onset_flips,
@@ -115,11 +116,14 @@ def _focus_rows(ws, monotonic_wave=False):
                    (meta["width"], meta["height"]),
                    set(spec.get("no_backfill", [])))
     gf = guide_frame(guide)
+    ovs = overrides.load(ws)
     state_of = {}
     for tr in wt["tracks"]:
         if tr["id"] in focus:
-            states, flips = focus_states(tr["speed"], fps, v_stop, v_move)
-            state_of[tr["id"]] = (states, onset_flips(states, flips))
+            states, _ = focus_states(tr["speed"], fps, v_stop, v_move)
+            overrides.apply(states, tr["frames"], ovs.get(tr["id"]))
+            flips = onset_flips(states, overrides.stop_commits(states))
+            state_of[tr["id"]] = (states, flips)
     if monotonic_wave:
         order_wave(wt, state_of, gf)
 

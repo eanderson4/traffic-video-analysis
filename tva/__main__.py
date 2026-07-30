@@ -33,6 +33,17 @@ def main():
     p.add_argument("--work", required=True)
     p.add_argument("--monotonic-wavefront", action="store_true")
 
+    p = sub.add_parser("override", help="pin a focus car's state from a "
+                                        "frame on, sticky until the "
+                                        "engine's next state change")
+    p.add_argument("--work", required=True)
+    p.add_argument("--track", type=int)
+    p.add_argument("--frame", type=int)
+    p.add_argument("--state", choices=("rolling", "braking", "stopped"))
+    p.add_argument("--remove", action="store_true",
+                   help="drop overrides for --track (all, or only --frame)")
+    p.add_argument("--list", action="store_true")
+
     p = sub.add_parser("qa", help="kinematic QA metrics + wave fit")
     p.add_argument("--work", required=True)
     p.add_argument("--tag", default="", help="write qa/report-<tag>.json")
@@ -114,6 +125,21 @@ def main():
     elif args.cmd == "wavevid":
         from . import viz
         viz.wave_video(ws, monotonic_wave=args.monotonic_wavefront)
+    elif args.cmd == "override":
+        from . import overrides
+        if args.list:
+            for tid, ovs in sorted(overrides.load(ws).items()):
+                for f, st in ovs:
+                    print(f"track {tid}: {st} from frame {f}")
+        elif args.remove:
+            if args.track is None:
+                ap.error("--remove needs --track")
+            overrides.remove(ws, args.track, args.frame)
+        else:
+            if None in (args.track, args.frame, args.state):
+                ap.error("need --track, --frame and --state "
+                         "(or --list / --remove)")
+            overrides.add(ws, args.track, args.frame, args.state)
     elif args.cmd == "edit":
         from . import lane_edit
         lane_edit.run(ws, port=args.port)

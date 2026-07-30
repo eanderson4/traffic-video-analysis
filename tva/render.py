@@ -11,6 +11,7 @@ import subprocess
 import cv2
 import numpy as np
 
+from . import overrides
 from .stabilize import apply_h
 from .viz import speed_color
 
@@ -573,20 +574,27 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=(),
         print(f"{len(focus)} vehicles in focus lane")
         # quantize each focus car to rolling/braking/stopped AFTER the
         # recovery passes, so states line up with the final speed arrays;
-        # rings/pops fire on onset flips only (re-armed by rolling again)
+        # hand overrides stick until the engine's next change, and
+        # rings/pops fire on onset flips of the DISPLAYED sequence
+        ovs = overrides.load(ws)
+        if ovs:
+            print(f"{sum(map(len, ovs.values()))} hand state overrides")
         state_of = {}
         for tr in wt["tracks"]:
             if tr["id"] in focus:
-                states, flips = focus_states(tr["speed"], fps, v_stop, v_move)
-                state_of[tr["id"]] = (states, onset_flips(states, flips))
+                states, _ = focus_states(tr["speed"], fps, v_stop, v_move)
+                overrides.apply(states, tr["frames"], ovs.get(tr["id"]))
+                flips = onset_flips(states, overrides.stop_commits(states))
+                state_of[tr["id"]] = (states, flips)
         if guide is not None and monotonic_wave:
             order_wave(wt, state_of, gf)
     pop_n = max(1, int(POP_S * fps))
-    # focus onset rings ride the state machine's commit-to-stopped, so ring
-    # + pop always coincide with the visible flip. kinematics stop_events
-    # predate stitching/backfill: manual cars have none, stitched cars kept
-    # theirs under the discarded fragment id — those events are dropped
-    # from the quiet rings below since the focus ring now speaks for them
+    # focus onset rings ride the DISPLAYED commits to stopped (state machine
+    # plus hand overrides), so ring + pop always coincide with the visible
+    # flip. kinematics stop_events predate stitching/backfill: manual cars
+    # have none, stitched cars kept theirs under the discarded fragment id —
+    # those events are dropped from the quiet rings below since the focus
+    # ring now speaks for them
     focus_rings = []
     for tr in wt["tracks"]:
         if focus and tr["id"] in state_of:
