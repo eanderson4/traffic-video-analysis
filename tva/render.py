@@ -24,6 +24,7 @@ TRAIL_STRAIGHT = 0.8   # net/path ratio below this = registration curl
                        # (a real 90-degree turn over TRAIL_S is ~0.90)
 FOCUS_R = 1.7          # focus-lane marker radius multiplier
 FOCUS_RING_W = 5       # focus-lane white outline thickness
+FOCUS_ALPHA = 0.75     # loud-dot opacity: the vehicle stays visible under it
 CORRIDOR_HW = 48       # focus-lane corridor minimum half-width (world px)
 CORRIDOR_PAD = 40      # corridor clearance beyond the outermost dot centers
 CORRIDOR_EXT = 2500    # end extension so the edges always exit the frame
@@ -564,15 +565,20 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
             for e in (e1, e2):
                 cv2.polylines(frame, [e.astype(np.int32)], False,
                               (235, 235, 235), 3, cv2.LINE_AA)
-        # focus lane on top at full opacity: neon speed color, bigger,
-        # thick white outline, heavier trail
-        for fpts, col, r, trail_ok in focus_ops:
-            if trail_ok:
-                cv2.polylines(frame, [fpts], False, col, max(3, r // 3),
-                              cv2.LINE_AA)
-            cv2.circle(frame, tuple(fpts[-1]), r + FOCUS_RING_W // 2 + 1,
-                       (255, 255, 255), FOCUS_RING_W, cv2.LINE_AA)
-            cv2.circle(frame, tuple(fpts[-1]), r, col, -1, cv2.LINE_AA)
+        # focus lane on top, undimmed: neon speed color, bigger, thick
+        # white outline, heavier trail - blended at FOCUS_ALPHA so the
+        # vehicle underneath stays visible
+        if focus_ops:
+            ov = frame.copy()
+            for fpts, col, r, trail_ok in focus_ops:
+                if trail_ok:
+                    cv2.polylines(ov, [fpts], False, col, max(3, r // 3),
+                                  cv2.LINE_AA)
+                cv2.circle(ov, tuple(fpts[-1]), r + FOCUS_RING_W // 2 + 1,
+                           (255, 255, 255), FOCUS_RING_W, cv2.LINE_AA)
+                cv2.circle(ov, tuple(fpts[-1]), r, col, -1, cv2.LINE_AA)
+            frame = cv2.addWeighted(ov, FOCUS_ALPHA, frame,
+                                    1 - FOCUS_ALPHA, 0)
         for ev, f0 in rings:
             if f0 <= i < f0 + ring_n and ev["track"] in focus:
                 age = (i - f0) / ring_n
