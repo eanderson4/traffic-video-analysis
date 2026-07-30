@@ -548,10 +548,14 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=(),
         offs = np.concatenate(
             [locate_on_guide(gf, tr["x"], tr["y"])[1]
              for tr in wt["tracks"] if tr["id"] in focus])
+        # 1st/99th percentile, not true extremes: one stray loud dot (an
+        # adjacent-lane car passing the offset_band test) would otherwise
+        # stretch the corridor for the whole clip; a 1% trim is ~100
+        # samples here, far more than any single fragment carries
         corridor = lane_corridor(
             guide,
-            min(-CORRIDOR_HW, offs.min() - CORRIDOR_PAD),
-            max(CORRIDOR_HW, offs.max() + CORRIDOR_PAD))
+            min(-CORRIDOR_HW, np.percentile(offs, 1) - CORRIDOR_PAD),
+            max(CORRIDOR_HW, np.percentile(offs, 99) + CORRIDOR_PAD))
     if focus:
         print(f"{len(focus)} vehicles in focus lane")
         # quantize each focus car to rolling/braking/stopped AFTER the
