@@ -293,10 +293,15 @@ def stitch_focus(wt, focus, gf, car_len, fps, px_of, exclude, parked):
                 break
             c = best[1]
             used.add(c["id"])
+            sp = list(c["speed"])
+            if c["id"] < 0 and len(sp) == 1:
+                # a single-keyframe manual car carries no speed of its own;
+                # inherit the entry speed of the track it becomes
+                sp = [tr["speed"][0]]
             tr["frames"] = list(c["frames"]) + list(tr["frames"])
             tr["x"] = list(c["x"]) + list(tr["x"])
             tr["y"] = list(c["y"]) + list(tr["y"])
-            tr["speed"] = list(c["speed"]) + list(tr["speed"])
+            tr["speed"] = sp + list(tr["speed"])
             px_of[fid].update(px_of[c["id"]])
             focus.discard(c["id"])
     if used:
