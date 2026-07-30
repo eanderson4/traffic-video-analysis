@@ -266,11 +266,17 @@ def stitch_focus(wt, focus, gf, car_len, fps, px_of, exclude, parked):
             best = None
             for c in wt["tracks"]:
                 cid = c["id"]
-                if (cid == fid or cid < 0 or cid in used or cid in exclude
-                        or cid in parked or len(c["frames"]) < 3):
+                if (cid == fid or cid in used or cid in exclude
+                        or cid in parked):
+                    continue
+                # manual cars (negative ids) are hand-placed history for a
+                # later real track: any length, any gap - the annotator
+                # says the car was there
+                if cid >= 0 and len(c["frames"]) < 3:
                     continue
                 fc = c["frames"][-1]
-                if not 0 < f0 - fc <= max_gap:
+                if not (0 < f0 - fc and
+                        (cid < 0 or f0 - fc <= max_gap)):
                     continue
                 pc = np.array([c["x"][-1], c["y"][-1]])
                 if abs(locate_on_guide(gf, [pc[0]], [pc[1]])[1][0]
