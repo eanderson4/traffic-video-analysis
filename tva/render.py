@@ -503,14 +503,15 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
     parked = hidden_ids(ws, wt, roads)
 
     corridor = None
+    stitched = set()
     guide = (lane_guide_path(wt, focus, roads, spec, car_len)
              if focus and roads and spec else None)
     if guide is not None:
         # recover the cars detection loses early: chain real fragments
         # first, then hold already-stopped cars back to frame 0, then refit
         # the guide and size the corridor off the actual dot offsets
-        stitch_focus(wt, focus, guide_frame(guide), car_len, fps, px_of,
-                     set(spec.get("exclude", [])), parked)
+        stitched = stitch_focus(wt, focus, guide_frame(guide), car_len, fps,
+                                px_of, set(spec.get("exclude", [])), parked)
         guide = lane_guide_path(wt, focus, roads, spec, car_len)
         backfill_focus(wt, focus, car_len, v_stop, px_of, Hinv, (w, h),
                        set(spec.get("no_backfill", [])))
@@ -529,6 +530,17 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
         state_of = {tr["id"]: focus_states(tr["speed"], fps, v_stop, v_move)
                     for tr in wt["tracks"] if tr["id"] in focus}
     pop_n = max(1, int(POP_S * fps))
+    # focus onset rings ride the state machine's commit-to-stopped, so ring
+    # + pop always coincide with the visible flip. kinematics stop_events
+    # predate stitching/backfill: manual cars have none, stitched cars kept
+    # theirs under the discarded fragment id — those events are dropped
+    # from the quiet rings below since the focus ring now speaks for them
+    focus_rings = []
+    for tr in wt["tracks"]:
+        if focus and tr["id"] in state_of:
+            for j in state_of[tr["id"]][1]:
+                focus_rings.append(
+                    (tr["frames"][j], tr["x"][j], tr["y"][j]))
 
     # frame index -> [(track, obs index)]; fractional index = interpolated
     # frame inside a short detection dropout (dots persist through flicker)
@@ -549,7 +561,8 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
             if 1 < g <= gm:
                 for f in range(F[k] + 1, min(F[k + 1], n)):
                     per_frame[f].append((tr, k + (f - F[k]) / g))
-    rings = [(ev, ev["frame"]) for ev in wt["stop_events"]]
+    rings = [(ev, ev["frame"]) for ev in wt["stop_events"]
+             if ev["track"] not in stitched]
     trail_n = int(TRAIL_S * fps)
     ring_n = max(1, int(RING_S * fps))
 
@@ -668,10 +681,10 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
                 cv2.circle(ov, tuple(fpts[-1]), r, col, -1, cv2.LINE_AA)
             frame = cv2.addWeighted(ov, FOCUS_ALPHA, frame,
                                     1 - FOCUS_ALPHA, 0)
-        for ev, f0 in rings:
-            if f0 <= i < f0 + ring_n and ev["track"] in focus:
+        for f0, ex, ey in focus_rings:
+            if f0 <= i < f0 + ring_n:
                 age = (i - f0) / ring_n
-                p = apply_h(Hinv[i], [(ev["x"], ev["y"])])[0].astype(int)
+                p = apply_h(Hinv[i], [(ex, ey)])[0].astype(int)
                 rr = int(40 + 120 * age)
                 c = int(255 * (1 - 0.5 * age))
                 cv2.circle(frame, tuple(p), rr, (c, c, 255), 7, cv2.LINE_AA)
