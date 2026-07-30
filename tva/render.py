@@ -22,15 +22,27 @@ R_MAX = 40             # marker radius cap (src-frame px)
 TRAIL_MIN_LEN = 0.5    # car_len; shorter world paths draw no trail
 TRAIL_STRAIGHT = 0.8   # net/path ratio below this = registration curl
                        # (a real 90-degree turn over TRAIL_S is ~0.90)
-FOCUS_R = 1.7          # focus-lane marker radius multiplier
+FOCUS_DOT_R = 34       # focus-lane marker radius (src-frame px), uniform:
+                       # state/color is the story, not apparent vehicle size
 FOCUS_RING_W = 5       # focus-lane white outline thickness
 FOCUS_ALPHA = 0.75     # loud-dot opacity: the vehicle stays visible under it
 CORRIDOR_HW = 48       # focus-lane corridor minimum half-width (world px)
 CORRIDOR_PAD = 40      # corridor clearance beyond the outermost dot centers
 CORRIDOR_EXT = 2500    # end extension so the edges always exit the frame
 CORRIDOR_DIM = 0.55    # brightness outside the corridor (1.0 = no dim)
+CORRIDOR_TIGHT = 0.93  # pull the edge lines in toward the dots (<1 = tighter)
 STITCH_GAP_S = 8       # max dropout when chaining early fragments
 BACKFILL_V = 1.5       # x v_stop: "already stopped at first detection"
+STOP_ENTER = 1.0       # x v_stop: candidate stopped below this
+STOP_EXIT = 1.8        # x v_stop: leave stopped only above this, sustained
+BRAKE_ENTER = 1.7      # x v_move: candidate braking below this
+BRAKE_EXIT = 2.2       # x v_move: back to rolling only above this
+STATE_DEB_S = 0.2      # a new state must hold this long to commit
+POP_S = 0.4            # dot pop duration when a focus car commits to stopped
+POP_SCALE = 1.4        # peak pop radius multiplier
+# quantized focus-lane states; RGB matching the continuous ramp's anchors
+STATE_RGB = {"rolling": (60, 200, 90), "braking": (235, 170, 50),
+             "stopped": (235, 60, 50)}
 
 # per-road hues (BGR), cycled
 ROAD_COLORS = [(255, 91, 46), (255, 200, 0), (180, 0, 255), (0, 200, 255),
@@ -391,6 +403,52 @@ def neon(col):
     return tuple(int(c) for c in cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0])
 
 
+def focus_states(speed, fps, v_stop, v_move):
+    """Quantize a focus car's smoothed speed into rolling/braking/stopped.
+
+    The continuous ramp leaves cars hovering in amber and flickering with
+    measurement noise; the wave wants crisp hand-offs. Hysteresis bands
+    (enter vs exit thresholds off v_stop/v_move) plus a debounce (the
+    candidate state must hold STATE_DEB_S) make each car flip to solid red
+    once and stay there — registration noise on a queued car reads as fake
+    creep below STOP_EXIT and never flip-flops the dot. Returns (state per
+    sample, sample indices where the state commits to stopped)."""
+    s_in, s_out = STOP_ENTER * v_stop, STOP_EXIT * v_stop
+    b_in, b_out = BRAKE_ENTER * v_move, BRAKE_EXIT * v_move
+    deb = max(1, int(STATE_DEB_S * fps))
+
+    def classify(v, st):
+        if st == "stopped":
+            return st if v <= s_out else (
+                "braking" if v <= b_out else "rolling")
+        if st == "braking":
+            return "stopped" if v < s_in else (
+                st if v <= b_out else "rolling")
+        return "stopped" if v < s_in else ("braking" if v < b_in else st)
+
+    v0 = speed[0] if speed else 0.0
+    st = "stopped" if v0 < s_in else ("braking" if v0 < b_in else "rolling")
+    states, flips = [], []
+    pend, cnt = None, 0
+    for v in speed:
+        # classify against the PENDING state once a transition starts, so
+        # the hysteresis band keeps it alive: entry begins past the enter
+        # threshold and holds anywhere this side of the exit threshold
+        tgt = classify(v, pend if pend is not None else st)
+        if tgt == st:
+            pend, cnt = None, 0
+        elif tgt == pend:
+            cnt += 1
+            if cnt >= deb:
+                if tgt == "stopped":
+                    flips.append(len(states))
+                st, pend, cnt = tgt, None, 0
+        else:
+            pend, cnt = tgt, 1
+        states.append(st)
+    return states, flips
+
+
 def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
     meta = ws.meta
     fps, n = meta["fps"], meta["n_frames"]
@@ -456,10 +514,17 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
              for tr in wt["tracks"] if tr["id"] in focus])
         corridor = lane_corridor(
             guide,
-            min(-CORRIDOR_HW, np.percentile(offs, 1) - CORRIDOR_PAD),
-            max(CORRIDOR_HW, np.percentile(offs, 99) + CORRIDOR_PAD))
+            CORRIDOR_TIGHT * min(-CORRIDOR_HW,
+                                 np.percentile(offs, 1) - CORRIDOR_PAD),
+            CORRIDOR_TIGHT * max(CORRIDOR_HW,
+                                 np.percentile(offs, 99) + CORRIDOR_PAD))
     if focus:
         print(f"{len(focus)} vehicles in focus lane")
+        # quantize each focus car to rolling/braking/stopped AFTER the
+        # recovery passes, so states line up with the final speed arrays
+        state_of = {tr["id"]: focus_states(tr["speed"], fps, v_stop, v_move)
+                    for tr in wt["tracks"] if tr["id"] in focus}
+    pop_n = max(1, int(POP_S * fps))
 
     # frame index -> [(track, obs index)]; fractional index = interpolated
     # frame inside a short detection dropout (dots persist through flicker)
@@ -541,8 +606,16 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
             trail_ok = (len(fpts) > 1 and plen > TRAIL_MIN_LEN * car_len
                         and net > TRAIL_STRAIGHT * plen)
             if tr["id"] in focus:
-                focus_ops.append((fpts, neon(col),
-                                  int(r * FOCUS_R), trail_ok))
+                states, flips = state_of[tr["id"]]
+                fcol = neon(STATE_RGB[states[k0]][::-1])
+                fr = FOCUS_DOT_R
+                for j in flips:     # pop on commit to stopped (sin pulse)
+                    age = (i - tr["frames"][j]) / pop_n
+                    if 0 <= age < 1:
+                        fr = int(fr * (1 + (POP_SCALE - 1)
+                                       * np.sin(np.pi * age)))
+                        break
+                focus_ops.append((fpts, fcol, fr, trail_ok))
                 continue
             if trail_ok:
                 cv2.polylines(layer, [fpts], False, col, max(2, r // 4),
