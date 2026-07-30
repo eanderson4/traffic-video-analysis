@@ -24,6 +24,8 @@ TRAIL_STRAIGHT = 0.8   # net/path ratio below this = registration curl
                        # (a real 90-degree turn over TRAIL_S is ~0.90)
 FOCUS_R = 1.7          # focus-lane marker radius multiplier
 FOCUS_RING_W = 5       # focus-lane white outline thickness
+CORRIDOR_HW = 48       # focus-lane corridor half-width (world px)
+CORRIDOR_DIM = 0.55    # brightness outside the corridor (1.0 = no dim)
 
 # per-road hues (BGR), cycled
 ROAD_COLORS = [(255, 91, 46), (255, 200, 0), (180, 0, 255), (0, 200, 255),
@@ -210,6 +212,23 @@ def lane_guide_path(wt, focus, roads, spec, car_len):
     return p
 
 
+def lane_corridor(guide, hw=CORRIDOR_HW):
+    """Two world-plane edge polylines bracketing the focus lane: the
+    fitted guide centerline +/- hw, ends extended along their tangents so
+    the corridor keeps going past where the dot data stops."""
+    if guide is None or len(guide) < 2:
+        return None
+    t0 = guide[0] - guide[1]
+    t1 = guide[-1] - guide[-2]
+    t0 /= max(np.hypot(*t0), 1e-9)
+    t1 /= max(np.hypot(*t1), 1e-9)
+    g = np.vstack([guide[0] + t0 * 700, guide, guide[-1] + t1 * 700])
+    tang = np.gradient(g, axis=0)
+    tang /= np.maximum(np.hypot(tang[:, 0], tang[:, 1])[:, None], 1e-9)
+    nrm = np.column_stack([-tang[:, 1], tang[:, 0]])
+    return g - nrm * hw, g + nrm * hw
+
+
 def neon(col):
     """Push a BGR color to full saturation/value: the focus-lane variant of
     the speed ramp (same red=stopped/green=moving semantics, louder)."""
@@ -266,9 +285,10 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
     if focus:
         print(f"{len(focus)} vehicles in focus lane")
 
-    guide = None
+    corridor = None
     if focus and roads and spec:
-        guide = lane_guide_path(wt, focus, roads, spec, car_len)
+        corridor = lane_corridor(
+            lane_guide_path(wt, focus, roads, spec, car_len))
 
     parked = hidden_ids(ws, wt, roads)
 
@@ -313,10 +333,6 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
         focus_ops = []          # focus-lane draws go on top of the blend
         if roads_draw and roads:
             draw_roads(layer, roads, Hinv[i])
-        if guide is not None:   # fitted focus-lane centerline, under dots
-            g = apply_h(Hinv[i], guide).astype(np.int32)
-            cv2.polylines(layer, [g], False, (30, 30, 30), 10, cv2.LINE_AA)
-            cv2.polylines(layer, [g], False, (255, 255, 255), 4, cv2.LINE_AA)
         for tr, k in per_frame[i] if "cars" in layers else []:
             k0 = int(k)
             frac = k - k0
@@ -375,6 +391,23 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
                 cv2.circle(layer, tuple(p), rr, (c, c, c), 4, cv2.LINE_AA)
         frame = cv2.addWeighted(layer, LAYER_ALPHA, frame,
                                 1 - LAYER_ALPHA, 0)
+        # spotlight corridor: everything outside the lane (video AND the
+        # quiet overlays) dulls, complexity stays legible underneath;
+        # edge lines bracket the loud dots so the lane reads as a shape
+        if corridor is not None:
+            e1 = apply_h(Hinv[i], corridor[0])
+            e2 = apply_h(Hinv[i], corridor[1])
+            poly = np.vstack([e1, e2[::-1]]).astype(np.int32)
+            mask = np.zeros(frame.shape[:2], np.uint8)
+            cv2.fillPoly(mask, [poly], 255)
+            mask = cv2.blur(mask, (81, 81))
+            a = CORRIDOR_DIM + (1 - CORRIDOR_DIM) * (
+                mask.astype(np.float32) / 255)
+            frame = (frame.astype(np.float32) * a[..., None]) \
+                .astype(np.uint8)
+            for e in (e1, e2):
+                cv2.polylines(frame, [e.astype(np.int32)], False,
+                              (235, 235, 235), 3, cv2.LINE_AA)
         # focus lane on top at full opacity: neon speed color, bigger,
         # thick white outline, heavier trail
         for fpts, col, r, trail_ok in focus_ops:
