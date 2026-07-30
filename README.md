@@ -44,6 +44,10 @@ every stage is inspectable and cacheable:
 | `tracks.json` | `detect` | per track: class, per-frame box center/size/conf |
 | `world_tracks.json` | `world` | per track: reference-plane positions, smoothed speed, state runs, stop events |
 | `centerline.json` | `world` | road spine polyline in the reference plane |
+| `roads.json` | `roads` | per-road centerline, lane offsets, measured boundaries |
+| `statics.json` | hand | known-fixed zones (parking lots, depots) where registration drift reads as fake speed; render hides tracks inside |
+| `focus_lane.json` | hand + `edit` | hand-picked loud lane: road + offset band, include/exclude click deltas, optional `no_backfill` ids |
+| `manual_tracks.json` | `edit` | hand-keyframed cars (image px); lifted to world at render time, linked forward onto their future real track |
 | `qa/` | all | visual checks per stage |
 
 ## Usage
@@ -57,7 +61,19 @@ python -m tva spacetime --work <dir>            # space-time diagram PNG
 python -m tva speedqa --work <dir>              # raw vs smoothed speed profiles
 python -m tva render --work <dir>               # speed-colored overlay video
 python -m tva render --work <dir> --roads --highlight 33,49   # optional layers
+python -m tva edit --work <dir> --port 8123     # focus-lane editor (browser)
 ```
+
+### Focus lane (hero-clip storytelling)
+
+Seed `focus_lane.json` with a road index + rough offset band, then curate
+in `tva edit`: click cars loud/quiet, shift-click keyframes for missed
+cars. The render gives loud cars neon styling inside a spotlight corridor
+fitted from their paths, and recovers what detection missed early —
+backwards fragment stitching, held-position backfill for already-stopped
+cars, manual cars linked forward onto the real track they become. The
+editor runs the same recovery pass, so what you see is what renders.
+Process notes + speedup backlog: `docs/retro-ep03-hero.md`.
 
 `render` draws cars only by default (`--roads` adds the inferred road/lane
 overlay; `--highlight` enlarges + outlines specific track ids for
