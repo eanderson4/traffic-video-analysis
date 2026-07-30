@@ -34,11 +34,12 @@ CORRIDOR_DIM = 0.55    # brightness outside the corridor (1.0 = no dim)
 STITCH_GAP_S = 8       # max dropout when chaining early fragments
 BACKFILL_V = 1.5       # x v_stop: "already stopped at first detection"
 STOP_ENTER = 1.0       # x v_stop: candidate stopped below this
-STOP_EXIT = 1.8        # x v_stop: leave stopped only above this, sustained
 BRAKE_ENTER = 1.7      # x v_move: candidate braking below this
 BRAKE_EXIT = 2.2       # x v_move: back to rolling only above this
 STATE_DEB_S = 0.2      # a new state must hold this long to commit
-STICKY_STOP = True     # focus cars never leave stopped (jam only grows)
+GO_DEB_S = 0.5         # leaving stopped needs this long above BRAKE_EXIT:
+                       # queue creep tops out ~1.6x v_move, genuine
+                       # restarts sustain >2.6x v_move — no amber exit
 POP_S = 0.4            # dot pop duration when a focus car commits to stopped
 POP_SCALE = 1.4        # peak pop radius multiplier
 # quantized focus-lane states; RGB matching the continuous ramp's anchors
@@ -411,19 +412,19 @@ def focus_states(speed, fps, v_stop, v_move):
     measurement noise; the wave wants crisp hand-offs. Hysteresis bands
     (enter vs exit thresholds off v_stop/v_move) plus a debounce (the
     candidate state must hold STATE_DEB_S) make each car flip to solid red
-    once. Stopped is STICKY (STICKY_STOP): in this clip the jam only grows,
-    so once a car commits to red it never leaves — slow registration creep
-    on a queued car can exceed any exit threshold for seconds at a time and
-    would otherwise read as amber/green shimmer mid-queue. Returns (state
-    per sample, sample indices where the state commits to stopped)."""
-    s_in, s_out = STOP_ENTER * v_stop, STOP_EXIT * v_stop
+    once, crisply. Leaving stopped is deliberately hard: red exits only
+    directly to green, sustained above BRAKE_EXIT for GO_DEB_S — queue
+    creep from registration noise (~1.6x v_move) never gets out, a car
+    genuinely driving away does. Returns (state per sample, sample indices
+    where the state commits to stopped)."""
+    s_in = STOP_ENTER * v_stop
     b_in, b_out = BRAKE_ENTER * v_move, BRAKE_EXIT * v_move
     deb = max(1, int(STATE_DEB_S * fps))
+    go_deb = max(1, int(GO_DEB_S * fps))
 
     def classify(v, st):
         if st == "stopped":
-            return st if v <= s_out else (
-                "braking" if v <= b_out else "rolling")
+            return "rolling" if v > b_out else st
         if st == "braking":
             return "stopped" if v < s_in else (
                 st if v <= b_out else "rolling")
@@ -434,9 +435,6 @@ def focus_states(speed, fps, v_stop, v_move):
     states, flips = [], []
     pend, cnt = None, 0
     for v in speed:
-        if STICKY_STOP and st == "stopped":
-            states.append(st)
-            continue
         # classify against the PENDING state once a transition starts, so
         # the hysteresis band keeps it alive: entry begins past the enter
         # threshold and holds anywhere this side of the exit threshold
@@ -445,7 +443,7 @@ def focus_states(speed, fps, v_stop, v_move):
             pend, cnt = None, 0
         elif tgt == pend:
             cnt += 1
-            if cnt >= deb:
+            if cnt >= (go_deb if st == "stopped" else deb):
                 if tgt == "stopped":
                     flips.append(len(states))
                 st, pend, cnt = tgt, None, 0
@@ -455,7 +453,42 @@ def focus_states(speed, fps, v_stop, v_move):
     return states, flips
 
 
-def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
+def order_wave(wt, state_of, gf):
+    """Make the stop front continuous IN SPACE: ordered by station along
+    the lane, a car may not commit to stopped before its downstream
+    neighbor. Cars measured flipping early (queue pockets that pre-date
+    the clip, lumpy decel) hold braking until the front reaches them;
+    their pop/ring moves with the corrected commit. Only first flips are
+    ordered — a genuine restart + re-stop later is its own event."""
+    by_id = {tr["id"]: tr for tr in wt["tracks"]}
+    rows = []
+    for tid, (states, fl) in state_of.items():
+        if fl:
+            tr = by_id[tid]
+            s, _ = locate_on_guide(gf, [tr["x"][fl[0]]],
+                                   [tr["y"][fl[0]]])
+            rows.append((s[0], tid))
+    rows.sort()
+    front = -1
+    n_fix = 0
+    for _, tid in rows:
+        states, fl = state_of[tid]
+        tr = by_id[tid]
+        j = min(np.searchsorted(tr["frames"], max(front, tr["frames"][fl[0]])),
+                len(states) - 1)
+        front = tr["frames"][j]
+        if j > fl[0]:
+            for k in range(fl[0], j):
+                if states[k] == "stopped":
+                    states[k] = "braking"
+            fl[0] = j
+            n_fix += 1
+    if n_fix:
+        print(f"wave order: held {n_fix} early flips to the marching front")
+
+
+def run(ws, out=None, out_w=1920, layers=("cars",), highlight=(),
+        monotonic_wave=False):
     meta = ws.meta
     fps, n = meta["fps"], meta["n_frames"]
     w, h = meta["width"], meta["height"]
@@ -529,6 +562,8 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
         # recovery passes, so states line up with the final speed arrays
         state_of = {tr["id"]: focus_states(tr["speed"], fps, v_stop, v_move)
                     for tr in wt["tracks"] if tr["id"] in focus}
+        if guide is not None and monotonic_wave:
+            order_wave(wt, state_of, gf)
     pop_n = max(1, int(POP_S * fps))
     # focus onset rings ride the state machine's commit-to-stopped, so ring
     # + pop always coincide with the visible flip. kinematics stop_events

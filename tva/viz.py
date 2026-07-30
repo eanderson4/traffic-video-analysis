@@ -76,23 +76,21 @@ def spacetime(ws, out_w=1400, out_h=1000):
     print(f"wrote {out}")
 
 
-def focus_wave(ws, out_w=1800, out_h=1000):
-    """Focus-lane wave diagram: the loud dots laid out in 1D.
+def _focus_rows(ws, monotonic_wave=False):
+    """Focus-lane recovery + state pipeline shared by the wave QA outputs.
 
-    x = time, y = station along the fitted lane guide; every sample of every
-    focus track is one dot colored by its quantized rolling/braking/stopped
-    state, white circles mark commits to stopped. A clean shockwave reads as
-    a single diagonal red boundary marching upstream; noise reads as
-    speckle off the boundary. Mirrors the render's recovery pass so the
-    states shown are exactly the ones the overlay draws.
+    Mirrors the render exactly (stitch, backfill, quantized states, and the
+    optional monotonic-wavefront pass), so these views show the states the
+    overlay draws. Returns (meta, rows, s_lo, s_hi) with rows =
+    (track, station array, states, flip sample indices) per focus car.
     """
     from .render import (backfill_focus, focus_lane_ids, focus_states,
                          guide_frame, hidden_ids, lane_guide_path,
-                         locate_on_guide, manual_world, stitch_focus,
-                         STATE_RGB)
+                         locate_on_guide, manual_world, order_wave,
+                         stitch_focus)
 
     meta = ws.meta
-    fps, n = meta["fps"], meta["n_frames"]
+    fps = meta["fps"]
     wt = ws.load("world_tracks.json")
     v_stop, v_move = wt["v_stop"], wt["v_move"]
     car_len = wt["car_len_px"]
@@ -117,6 +115,10 @@ def focus_wave(ws, out_w=1800, out_h=1000):
                    (meta["width"], meta["height"]),
                    set(spec.get("no_backfill", [])))
     gf = guide_frame(guide)
+    state_of = {tr["id"]: focus_states(tr["speed"], fps, v_stop, v_move)
+                for tr in wt["tracks"] if tr["id"] in focus}
+    if monotonic_wave:
+        order_wave(wt, state_of, gf)
 
     rows = []
     s_lo, s_hi = np.inf, -np.inf
@@ -124,9 +126,25 @@ def focus_wave(ws, out_w=1800, out_h=1000):
         if tr["id"] not in focus:
             continue
         s, _ = locate_on_guide(gf, tr["x"], tr["y"])
-        states, flips = focus_states(tr["speed"], fps, v_stop, v_move)
+        states, flips = state_of[tr["id"]]
         rows.append((tr, s, states, flips))
         s_lo, s_hi = min(s_lo, s.min()), max(s_hi, s.max())
+    return meta, rows, s_lo, s_hi
+
+
+def focus_wave(ws, out_w=1800, out_h=1000, monotonic_wave=False):
+    """Focus-lane wave diagram: the loud dots laid out in 1D.
+
+    x = time, y = station along the fitted lane guide; every sample of every
+    focus track is one dot colored by its quantized rolling/braking/stopped
+    state, white circles mark commits to stopped. A clean shockwave reads as
+    a single diagonal red boundary marching upstream; noise reads as
+    speckle off the boundary.
+    """
+    from .render import STATE_RGB
+
+    meta, rows, s_lo, s_hi = _focus_rows(ws, monotonic_wave)
+    fps, n = meta["fps"], meta["n_frames"]
 
     img = Image.new("RGB", (out_w, out_h), (16, 18, 24))
     d = ImageDraw.Draw(img)
@@ -156,6 +174,61 @@ def focus_wave(ws, out_w=1800, out_h=1000):
     d.text((out_w // 2, out_h - 40), "time (s) ->", fill=(160, 160, 160))
     out = f"{ws.qa}/focus-wave.png"
     img.save(out)
+    print(f"wrote {out}")
+
+
+def wave_video(ws, out_w=1920, out_h=260, monotonic_wave=False):
+    """1D strip video: the loud dots on the straightened lane, playing in
+    real time. x = station (downstream/front of queue at left, upstream at
+    right): cars travel right-to-left, the stop wave marches left-to-right.
+    Dot color = quantized state, white rings = commit to stopped."""
+    import subprocess
+
+    from .render import STATE_RGB
+
+    meta, rows, s_lo, s_hi = _focus_rows(ws, monotonic_wave)
+    fps, n = meta["fps"], meta["n_frames"]
+    mid = out_h // 2 + 10
+    rad = 10
+    ring_n = max(1, int(0.5 * fps))
+
+    def X(s):
+        return 60 + (out_w - 120) * (s - s_lo) / (s_hi - s_lo)
+
+    out = ws.path("focus-wave.mp4")
+    enc = subprocess.Popen(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "rawvideo", "-pix_fmt", "rgb24",
+         "-s", f"{out_w}x{out_h}", "-r", str(fps), "-i", "-",
+         "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+         "-pix_fmt", "yuv420p", "-movflags", "+faststart", out],
+        stdin=subprocess.PIPE)
+    for i in range(n):
+        img = Image.new("RGB", (out_w, out_h), (16, 18, 24))
+        d = ImageDraw.Draw(img)
+        d.line([(X(s_lo), mid), (X(s_hi), mid)], fill=(60, 64, 72), width=2)
+        for tr, s, states, flips in rows:
+            F = tr["frames"]
+            if i < F[0] or i > F[-1]:
+                continue
+            k = min(np.searchsorted(F, i, "right") - 1, len(states) - 1)
+            x = X(s[k])
+            d.ellipse([x - rad, mid - rad, x + rad, mid + rad],
+                      fill=STATE_RGB[states[k]])
+            for j in flips:
+                age = i - F[j]
+                if 0 <= age < ring_n:
+                    rr = rad + 4 + 26 * age / ring_n
+                    d.ellipse([x - rr, mid - rr, x + rr, mid + rr],
+                              outline=(255, 255, 255), width=3)
+        d.text((60, 16), f"t = {i / fps:5.2f}s", fill=(220, 220, 220))
+        d.text((X(s_lo) - 20, out_h - 32), "downstream (front of queue)",
+               fill=(160, 160, 160))
+        d.text((X(s_hi) - 150, out_h - 32), "upstream ->",
+               fill=(160, 160, 160))
+        enc.stdin.write(np.asarray(img).tobytes())
+    enc.stdin.close()
+    enc.wait()
     print(f"wrote {out}")
 
 

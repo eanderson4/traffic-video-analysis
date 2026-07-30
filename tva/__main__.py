@@ -24,6 +24,14 @@ def main():
 
     p = sub.add_parser("waveqa", help="focus-lane 1D space-time wave diagram")
     p.add_argument("--work", required=True)
+    p.add_argument("--monotonic-wavefront", action="store_true",
+                   help="enforce spatially ordered stop flips down the "
+                        "focus lane (storytelling; off = honest measurement)")
+
+    p = sub.add_parser("wavevid", help="focus-lane 1D strip video "
+                                       "(dots on a straightened lane)")
+    p.add_argument("--work", required=True)
+    p.add_argument("--monotonic-wavefront", action="store_true")
 
     p = sub.add_parser("qa", help="kinematic QA metrics + wave fit")
     p.add_argument("--work", required=True)
@@ -35,6 +43,7 @@ def main():
                    help="draw inferred road/lane overlay (off by default)")
     p.add_argument("--highlight", default="",
                    help="comma-separated track ids to enlarge + outline")
+    p.add_argument("--monotonic-wavefront", action="store_true")
 
     p = sub.add_parser("edit", help="interactive focus-lane editor "
                                     "(click cars loud/quiet in a browser)")
@@ -101,7 +110,10 @@ def main():
         viz.speed_qa(ws, track_ids=ids or None, suffix=args.suffix)
     elif args.cmd == "waveqa":
         from . import viz
-        viz.focus_wave(ws)
+        viz.focus_wave(ws, monotonic_wave=args.monotonic_wavefront)
+    elif args.cmd == "wavevid":
+        from . import viz
+        viz.wave_video(ws, monotonic_wave=args.monotonic_wavefront)
     elif args.cmd == "edit":
         from . import lane_edit
         lane_edit.run(ws, port=args.port)
@@ -109,7 +121,8 @@ def main():
         from . import render
         layers = ("roads", "cars") if args.roads else ("cars",)
         hot = {int(s) for s in args.highlight.split(",") if s.strip()}
-        render.run(ws, layers=layers, highlight=hot)
+        render.run(ws, layers=layers, highlight=hot,
+                   monotonic_wave=args.monotonic_wavefront)
 
 
 if __name__ == "__main__":
