@@ -76,6 +76,89 @@ def spacetime(ws, out_w=1400, out_h=1000):
     print(f"wrote {out}")
 
 
+def focus_wave(ws, out_w=1800, out_h=1000):
+    """Focus-lane wave diagram: the loud dots laid out in 1D.
+
+    x = time, y = station along the fitted lane guide; every sample of every
+    focus track is one dot colored by its quantized rolling/braking/stopped
+    state, white circles mark commits to stopped. A clean shockwave reads as
+    a single diagonal red boundary marching upstream; noise reads as
+    speckle off the boundary. Mirrors the render's recovery pass so the
+    states shown are exactly the ones the overlay draws.
+    """
+    from .render import (backfill_focus, focus_lane_ids, focus_states,
+                         guide_frame, hidden_ids, lane_guide_path,
+                         locate_on_guide, manual_world, stitch_focus,
+                         STATE_RGB)
+
+    meta = ws.meta
+    fps, n = meta["fps"], meta["n_frames"]
+    wt = ws.load("world_tracks.json")
+    v_stop, v_move = wt["v_stop"], wt["v_move"]
+    car_len = wt["car_len_px"]
+    roads = ws.load("roads.json")["roads"]
+    spec = ws.load("focus_lane.json")
+    focus = focus_lane_ids(wt, roads, spec)
+    px_of = {}
+    for tr in ws.load("tracks.json")["tracks"]:
+        px_of[tr["id"]] = {o[0]: (o[1], o[2]) for o in tr["obs"]}
+    Hs = [np.asarray(m) for m in ws.load("homographies.json")["H"]]
+    for m in manual_world(ws, Hs, fps):
+        wt["tracks"].append(m["track"])
+        px_of[m["id"]] = m["px"]
+        focus.add(m["id"])
+    parked = hidden_ids(ws, wt, roads)
+    guide = lane_guide_path(wt, focus, roads, spec, car_len)
+    stitch_focus(wt, focus, guide_frame(guide), car_len, fps, px_of,
+                 set(spec.get("exclude", [])), parked)
+    guide = lane_guide_path(wt, focus, roads, spec, car_len)
+    Hinv = [np.linalg.inv(m) for m in Hs]
+    backfill_focus(wt, focus, car_len, v_stop, px_of, Hinv,
+                   (meta["width"], meta["height"]),
+                   set(spec.get("no_backfill", [])))
+    gf = guide_frame(guide)
+
+    rows = []
+    s_lo, s_hi = np.inf, -np.inf
+    for tr in wt["tracks"]:
+        if tr["id"] not in focus:
+            continue
+        s, _ = locate_on_guide(gf, tr["x"], tr["y"])
+        states, flips = focus_states(tr["speed"], fps, v_stop, v_move)
+        rows.append((tr, s, states, flips))
+        s_lo, s_hi = min(s_lo, s.min()), max(s_hi, s.max())
+
+    img = Image.new("RGB", (out_w, out_h), (16, 18, 24))
+    d = ImageDraw.Draw(img)
+    t_max = n / fps
+
+    def X(f):
+        return 70 + (out_w - 100) * (f / fps) / t_max
+
+    def Y(s):
+        return out_h - 60 - (out_h - 110) * (s - s_lo) / (s_hi - s_lo)
+
+    for tr, s, states, flips in rows:
+        for k, f in enumerate(tr["frames"]):
+            if f >= n:
+                continue
+            x, y = X(f), Y(s[k])
+            d.ellipse([x - 2, y - 2, x + 2, y + 2],
+                      fill=STATE_RGB[states[k]])
+        for j in flips:
+            x, y = X(tr["frames"][j]), Y(s[j])
+            d.ellipse([x - 6, y - 6, x + 6, y + 6], outline=(255, 255, 255),
+                      width=2)
+    d.text((70, 12), f"focus-lane wave ({len(rows)} tracks; "
+           "y = station along lane, circles = commit to stopped)",
+           fill=(220, 220, 220))
+    d.text((10, out_h // 2), "station ->", fill=(160, 160, 160))
+    d.text((out_w // 2, out_h - 40), "time (s) ->", fill=(160, 160, 160))
+    out = f"{ws.qa}/focus-wave.png"
+    img.save(out)
+    print(f"wrote {out}")
+
+
 def speed_qa(ws, n_tracks=10, track_ids=None, suffix=""):
     """Raw vs smoothed speed profiles for tracks with stop events.
 

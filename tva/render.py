@@ -38,6 +38,7 @@ STOP_EXIT = 1.8        # x v_stop: leave stopped only above this, sustained
 BRAKE_ENTER = 1.7      # x v_move: candidate braking below this
 BRAKE_EXIT = 2.2       # x v_move: back to rolling only above this
 STATE_DEB_S = 0.2      # a new state must hold this long to commit
+STICKY_STOP = True     # focus cars never leave stopped (jam only grows)
 POP_S = 0.4            # dot pop duration when a focus car commits to stopped
 POP_SCALE = 1.4        # peak pop radius multiplier
 # quantized focus-lane states; RGB matching the continuous ramp's anchors
@@ -410,9 +411,11 @@ def focus_states(speed, fps, v_stop, v_move):
     measurement noise; the wave wants crisp hand-offs. Hysteresis bands
     (enter vs exit thresholds off v_stop/v_move) plus a debounce (the
     candidate state must hold STATE_DEB_S) make each car flip to solid red
-    once and stay there — registration noise on a queued car reads as fake
-    creep below STOP_EXIT and never flip-flops the dot. Returns (state per
-    sample, sample indices where the state commits to stopped)."""
+    once. Stopped is STICKY (STICKY_STOP): in this clip the jam only grows,
+    so once a car commits to red it never leaves — slow registration creep
+    on a queued car can exceed any exit threshold for seconds at a time and
+    would otherwise read as amber/green shimmer mid-queue. Returns (state
+    per sample, sample indices where the state commits to stopped)."""
     s_in, s_out = STOP_ENTER * v_stop, STOP_EXIT * v_stop
     b_in, b_out = BRAKE_ENTER * v_move, BRAKE_EXIT * v_move
     deb = max(1, int(STATE_DEB_S * fps))
@@ -431,6 +434,9 @@ def focus_states(speed, fps, v_stop, v_move):
     states, flips = [], []
     pend, cnt = None, 0
     for v in speed:
+        if STICKY_STOP and st == "stopped":
+            states.append(st)
+            continue
         # classify against the PENDING state once a transition starts, so
         # the hysteresis band keeps it alive: entry begins past the enter
         # threshold and holds anywhere this side of the exit threshold
@@ -514,8 +520,8 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
              for tr in wt["tracks"] if tr["id"] in focus])
         corridor = lane_corridor(
             guide,
-            min(-CORRIDOR_HW, np.percentile(offs, 1) - CORRIDOR_PAD),
-            max(CORRIDOR_HW, np.percentile(offs, 99) + CORRIDOR_PAD))
+            min(-CORRIDOR_HW, offs.min() - CORRIDOR_PAD),
+            max(CORRIDOR_HW, offs.max() + CORRIDOR_PAD))
     if focus:
         print(f"{len(focus)} vehicles in focus lane")
         # quantize each focus car to rolling/braking/stopped AFTER the

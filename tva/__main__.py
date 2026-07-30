@@ -22,6 +22,9 @@ def main():
                    help="comma-separated track ids (default: auto-pick)")
     p.add_argument("--suffix", default="", help="output filename suffix")
 
+    p = sub.add_parser("waveqa", help="focus-lane 1D space-time wave diagram")
+    p.add_argument("--work", required=True)
+
     p = sub.add_parser("qa", help="kinematic QA metrics + wave fit")
     p.add_argument("--work", required=True)
     p.add_argument("--tag", default="", help="write qa/report-<tag>.json")
@@ -96,6 +99,9 @@ def main():
         from . import viz
         ids = [int(s) for s in args.tracks.split(",") if s.strip()]
         viz.speed_qa(ws, track_ids=ids or None, suffix=args.suffix)
+    elif args.cmd == "waveqa":
+        from . import viz
+        viz.focus_wave(ws)
     elif args.cmd == "edit":
         from . import lane_edit
         lane_edit.run(ws, port=args.port)
