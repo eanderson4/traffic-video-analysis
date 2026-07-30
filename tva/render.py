@@ -24,8 +24,12 @@ TRAIL_STRAIGHT = 0.8   # net/path ratio below this = registration curl
                        # (a real 90-degree turn over TRAIL_S is ~0.90)
 FOCUS_R = 1.7          # focus-lane marker radius multiplier
 FOCUS_RING_W = 5       # focus-lane white outline thickness
-CORRIDOR_HW = 48       # focus-lane corridor half-width (world px)
+CORRIDOR_HW = 48       # focus-lane corridor minimum half-width (world px)
+CORRIDOR_PAD = 40      # corridor clearance beyond the outermost dot centers
+CORRIDOR_EXT = 2500    # end extension so the edges always exit the frame
 CORRIDOR_DIM = 0.55    # brightness outside the corridor (1.0 = no dim)
+STITCH_GAP_S = 8       # max dropout when chaining early fragments
+BACKFILL_V = 1.5       # x v_stop: "already stopped at first detection"
 
 # per-road hues (BGR), cycled
 ROAD_COLORS = [(255, 91, 46), (255, 200, 0), (180, 0, 255), (0, 200, 255),
@@ -212,21 +216,157 @@ def lane_guide_path(wt, focus, roads, spec, car_len):
     return p
 
 
-def lane_corridor(guide, hw=CORRIDOR_HW):
+def guide_frame(guide, step=5.0):
+    """Densified guide polyline + arc-length stations + unit normals, for
+    station/offset queries against the fitted lane."""
+    d = np.hypot(*np.diff(guide, axis=0).T)
+    s = np.concatenate([[0], np.cumsum(d)])
+    si = np.arange(0.0, s[-1] + step, step)
+    g = np.column_stack([np.interp(si, s, guide[:, 0]),
+                         np.interp(si, s, guide[:, 1])])
+    t = np.gradient(g, axis=0)
+    t /= np.maximum(np.hypot(t[:, 0], t[:, 1])[:, None], 1e-9)
+    return g, si, np.column_stack([-t[:, 1], t[:, 0]])
+
+
+def locate_on_guide(gf, x, y):
+    """(station, signed lateral offset) of world points w.r.t. the guide."""
+    g, si, n = gf
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    d2 = (g[None, :, 0] - x[:, None]) ** 2 + (g[None, :, 1] - y[:, None]) ** 2
+    j = d2.argmin(axis=1)
+    off = (x - g[j, 0]) * n[j, 0] + (y - g[j, 1]) * n[j, 1]
+    return si[j], off
+
+
+def stitch_focus(wt, focus, gf, car_len, fps, px_of, exclude, parked):
+    """Chain early track fragments onto focus-lane tracks.
+
+    The oblique early view fragments tracks: the same physical car carries
+    a throwaway id until detection stabilizes, then gets a fresh one. For
+    each focus track, walk backwards through candidate fragments (real
+    detections, on the lane, continuous in time and position) and merge
+    them in; the focus gap bridge then interpolates across the joins."""
+    by_id = {tr["id"]: tr for tr in wt["tracks"]}
+    max_gap = int(STITCH_GAP_S * fps)
+    used = set()
+    for fid in sorted(focus, key=lambda t: by_id[t]["frames"][0]):
+        if fid < 0 or fid in used or fid not in focus:
+            continue
+        tr = by_id[fid]
+        while tr["frames"][0] > 0:
+            f0 = tr["frames"][0]
+            p0 = np.array([tr["x"][0], tr["y"][0]])
+            k = min(10, len(tr["frames"]) - 1)
+            vel = (np.array([tr["x"][k], tr["y"][k]]) - p0) \
+                / max(tr["frames"][k] - f0, 1)
+            off0 = locate_on_guide(gf, [p0[0]], [p0[1]])[1][0]
+            best = None
+            for c in wt["tracks"]:
+                cid = c["id"]
+                if (cid == fid or cid < 0 or cid in used or cid in exclude
+                        or cid in parked or len(c["frames"]) < 3):
+                    continue
+                fc = c["frames"][-1]
+                if not 0 < f0 - fc <= max_gap:
+                    continue
+                pc = np.array([c["x"][-1], c["y"][-1]])
+                if abs(locate_on_guide(gf, [pc[0]], [pc[1]])[1][0]
+                       - off0) > 25:
+                    continue
+                # where was this car at fc? back-extrapolate its own entry
+                # velocity; a jammed car predicts (essentially) in place
+                d = float(np.hypot(*(pc - (p0 - vel * (f0 - fc)))))
+                if d <= max(0.8 * car_len,
+                            0.3 * np.hypot(*vel) * (f0 - fc)):
+                    if best is None or d < best[0]:
+                        best = (d, c)
+            if best is None:
+                break
+            c = best[1]
+            used.add(c["id"])
+            tr["frames"] = list(c["frames"]) + list(tr["frames"])
+            tr["x"] = list(c["x"]) + list(tr["x"])
+            tr["y"] = list(c["y"]) + list(tr["y"])
+            tr["speed"] = list(c["speed"]) + list(tr["speed"])
+            px_of[fid].update(px_of[c["id"]])
+            focus.discard(c["id"])
+    if used:
+        wt["tracks"] = [t for t in wt["tracks"] if t["id"] not in used]
+        print(f"stitched {len(used)} early fragments into focus tracks")
+    return used
+
+
+def backfill_focus(wt, focus, car_len, v_stop, px_of, Hinv, wh, skip):
+    """Hold near-stationary focus cars at their first observed position
+    back to frame 0. The early oblique view misses cars deep in the queue;
+    a jammed car barely moves, so where detection eventually locks on is
+    where the car has been sitting all along. Cars still moving at first
+    detection genuinely arrived (or merged in) and get no synthetic
+    history - that is what fragment stitching and manual keyframes are
+    for."""
+    w, h = wh
+    occ = {}    # frame -> world positions of focus cars, for dedup
+    for tr in wt["tracks"]:
+        if tr["id"] in focus:
+            for f, x, y in zip(tr["frames"], tr["x"], tr["y"]):
+                occ.setdefault(f, []).append((x, y))
+    n_fill = 0
+    for tr in wt["tracks"]:
+        tid = tr["id"]
+        f0 = tr["frames"][0]
+        if tid not in focus or tid < 0 or tid in skip or f0 == 0:
+            continue
+        v0 = float(np.median(tr["speed"][:10]))
+        if v0 > BACKFILL_V * v_stop:
+            continue
+        x0, y0 = tr["x"][0], tr["y"][0]
+        # anchor: keep the drawn dot continuous with the detection at f0
+        det = px_of[tid].get(f0)
+        delta = (np.asarray(det, float)
+                 - apply_h(Hinv[f0], [(x0, y0)])[0]
+                 if det is not None else np.zeros(2))
+        add = []
+        for f in range(f0 - 1, -1, -1):
+            if any((x - x0) ** 2 + (y - y0) ** 2 < (0.65 * car_len) ** 2
+                   for x, y in occ.get(f, [])):
+                break
+            p = apply_h(Hinv[f], [(x0, y0)])[0] + delta
+            if not (-40 <= p[0] <= w + 40 and -40 <= p[1] <= h + 40):
+                break
+            add.append((f, p))
+        if not add:
+            continue
+        add.reverse()
+        tr["frames"] = [f for f, _ in add] + list(tr["frames"])
+        tr["x"] = [x0] * len(add) + list(tr["x"])
+        tr["y"] = [y0] * len(add) + list(tr["y"])
+        tr["speed"] = [v0] * len(add) + list(tr["speed"])
+        for f, p in add:
+            px_of[tid][f] = (float(p[0]), float(p[1]))
+            occ.setdefault(f, []).append((x0, y0))
+        n_fill += 1
+    if n_fill:
+        print(f"backfilled {n_fill} queued cars to their first frames")
+
+
+def lane_corridor(guide, lo=-CORRIDOR_HW, hi=CORRIDOR_HW):
     """Two world-plane edge polylines bracketing the focus lane: the
-    fitted guide centerline +/- hw, ends extended along their tangents so
-    the corridor keeps going past where the dot data stops."""
+    fitted guide centerline offset to lo/hi, ends extended along their
+    tangents far enough to always exit the frame."""
     if guide is None or len(guide) < 2:
         return None
-    t0 = guide[0] - guide[1]
-    t1 = guide[-1] - guide[-2]
+    a = min(5, len(guide) - 1)
+    t0 = guide[0] - guide[a]
+    t1 = guide[-1] - guide[-1 - a]
     t0 /= max(np.hypot(*t0), 1e-9)
     t1 /= max(np.hypot(*t1), 1e-9)
-    g = np.vstack([guide[0] + t0 * 700, guide, guide[-1] + t1 * 700])
+    g = np.vstack([guide[0] + t0 * CORRIDOR_EXT, guide,
+                   guide[-1] + t1 * CORRIDOR_EXT])
     tang = np.gradient(g, axis=0)
     tang /= np.maximum(np.hypot(tang[:, 0], tang[:, 1])[:, None], 1e-9)
     nrm = np.column_stack([-tang[:, 1], tang[:, 0]])
-    return g - nrm * hw, g + nrm * hw
+    return g + nrm * lo, g + nrm * hi
 
 
 def neon(col):
@@ -282,15 +422,31 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=()):
         px_of[m["id"]] = m["px"]
         size_of[m["id"]] = 80
         focus.add(m["id"])
-    if focus:
-        print(f"{len(focus)} vehicles in focus lane")
-
-    corridor = None
-    if focus and roads and spec:
-        corridor = lane_corridor(
-            lane_guide_path(wt, focus, roads, spec, car_len))
 
     parked = hidden_ids(ws, wt, roads)
+
+    corridor = None
+    guide = (lane_guide_path(wt, focus, roads, spec, car_len)
+             if focus and roads and spec else None)
+    if guide is not None:
+        # recover the cars detection loses early: chain real fragments
+        # first, then hold already-stopped cars back to frame 0, then refit
+        # the guide and size the corridor off the actual dot offsets
+        stitch_focus(wt, focus, guide_frame(guide), car_len, fps, px_of,
+                     set(spec.get("exclude", [])), parked)
+        guide = lane_guide_path(wt, focus, roads, spec, car_len)
+        backfill_focus(wt, focus, car_len, v_stop, px_of, Hinv, (w, h),
+                       set(spec.get("no_backfill", [])))
+        gf = guide_frame(guide)
+        offs = np.concatenate(
+            [locate_on_guide(gf, tr["x"], tr["y"])[1]
+             for tr in wt["tracks"] if tr["id"] in focus])
+        corridor = lane_corridor(
+            guide,
+            min(-CORRIDOR_HW, np.percentile(offs, 1) - CORRIDOR_PAD),
+            max(CORRIDOR_HW, np.percentile(offs, 99) + CORRIDOR_PAD))
+    if focus:
+        print(f"{len(focus)} vehicles in focus lane")
 
     # frame index -> [(track, obs index)]; fractional index = interpolated
     # frame inside a short detection dropout (dots persist through flicker)
