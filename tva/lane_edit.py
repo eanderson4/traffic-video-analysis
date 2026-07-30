@@ -13,11 +13,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cv2
 import numpy as np
 
-from .render import (backfill_focus, focus_lane_ids, guide_frame,
-                     hidden_ids, lane_guide_path, manual_world,
+from .render import (backfill_focus, focus_lane_ids, focus_states,
+                     guide_frame, hidden_ids, lane_guide_path, manual_world,
                      stitch_focus)
 
 VIEW_W = 1920  # frames served to the browser at this width
+
+STATE_CODE = {"rolling": "r", "braking": "b", "stopped": "s"}
 
 
 def build_data(ws):
@@ -45,6 +47,7 @@ def build_data(ws):
     # backfill) so the editor shows exactly the dots the render will draw;
     # backfilled frames are tagged so the client styles them apart
     first_real = {}
+    eng_states = {}
     if roads:
         focus = focus_lane_ids(wt, roads, spec)
         Hs = [np.asarray(m) for m in ws.load("homographies.json")["H"]]
@@ -65,12 +68,21 @@ def build_data(ws):
             backfill_focus(wt, focus, wt["car_len_px"], wt["v_stop"],
                            px_of, Hinv, (meta["width"], meta["height"]),
                            set(spec.get("no_backfill", [])))
+            # engine states (pre-override) per focus car; the client
+            # re-derives displayed states/rings as pins are edited
+            for tr in wt["tracks"]:
+                if tr["id"] not in focus:
+                    continue
+                eng, _ = focus_states(tr["speed"], meta["fps"],
+                                      wt["v_stop"], wt["v_move"])
+                eng_states[tr["id"]] = eng
 
     tracks = []
     for tr in wt["tracks"]:
         if tr["id"] in hidden or tr["id"] < 0:
             continue
-        F, X, Y, V = [], [], [], []
+        eng = eng_states.get(tr["id"])
+        F, X, Y, V, S = [], [], [], [], []
         for k, f in enumerate(tr["frames"]):
             p = px_of.get(tr["id"], {}).get(f)
             if p is None:
@@ -79,16 +91,24 @@ def build_data(ws):
             X.append(round(p[0]))
             Y.append(round(p[1]))
             V.append(round(tr["speed"][k], 1))
+            if eng is not None:
+                S.append(STATE_CODE[eng[k]])
         if F:
             t = {"id": tr["id"], "f": F, "x": X, "y": Y, "v": V}
             bf = first_real.get(tr["id"])
             if bf is not None and F[0] < bf:
                 t["bf"] = bf
+            if eng is not None:
+                t["es"] = "".join(S)          # engine states, pre-override
             tracks.append(t)
     try:
         man = ws.load("manual_tracks.json")["tracks"]
     except FileNotFoundError:
         man = []
+    try:
+        ovs_data = ws.load("state_overrides.json")
+    except FileNotFoundError:
+        ovs_data = {"overrides": []}
     return {
         "work": ws.dir,
         "manual": man,
@@ -98,6 +118,7 @@ def build_data(ws):
         "band": sorted(band),
         "include": sorted(spec.get("include", [])),
         "exclude": sorted(spec.get("exclude", [])),
+        "overrides": ovs_data.get("overrides", []),
         "tracks": tracks,
     }
 
@@ -187,8 +208,13 @@ def run(ws, port=8123):
             if "manual" in body:
                 with open(ws.path("manual_tracks.json"), "w") as fh:
                     json.dump({"tracks": body["manual"]}, fh, indent=1)
+            if "overrides" in body:
+                with open(ws.path("state_overrides.json"), "w") as fh:
+                    json.dump({"overrides": body["overrides"]}, fh,
+                              indent=1)
             print(f"saved focus_lane.json  include={spec['include']}  "
-                  f"exclude={spec['exclude']}")
+                  f"exclude={spec['exclude']}  "
+                  f"overrides={len(body.get('overrides', []))}")
             state["data"] = json.dumps(build_data(ws)).encode()
             self._send(200, "application/json", b'{"ok": true}')
 

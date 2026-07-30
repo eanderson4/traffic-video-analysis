@@ -26,7 +26,9 @@ TRAIL_STRAIGHT = 0.8   # net/path ratio below this = registration curl
 FOCUS_DOT_R = 29       # focus-lane marker radius (src-frame px), uniform:
                        # state/color is the story, not apparent vehicle size
 FOCUS_RING_W = 5       # focus-lane white outline thickness
-FOCUS_ALPHA = 0.75     # loud-dot opacity: the vehicle stays visible under it
+FOCUS_ALPHA = 0.75     # loud-dot outline/trail opacity
+FOCUS_FILL = 0.68      # inner fill opacity: the vehicle shows through a
+                       # touch more than the rim does
 CORRIDOR_HW = 48       # focus-lane corridor minimum half-width (world px)
 CORRIDOR_PAD = 15      # corridor clearance beyond the outermost dot centers:
                        # edges hug the loud-dot envelope, minimal dead space
@@ -451,15 +453,19 @@ def focus_states(speed, fps, v_stop, v_move):
 
 
 def onset_flips(states, flips):
-    """Stop commits that earn a ring/pop: the first, and any later one only
-    if the car has rolled (green) again since the previous commit. A
-    red->amber->red wobble is the same stop, not a new onset."""
-    out, armed = [], True
-    for k, j in enumerate(flips):
+    """Stop commits that earn a ring/pop. A commit rings only if the car
+    has ROLLED (green) at some point since the previous commit — or ever,
+    for the first one. A car that has never been green never rings: a
+    start-red -> amber -> red wobble is the same stop, not an onset."""
+    out, armed = [], False
+    prev = 0
+    for j in flips:
+        if "rolling" in states[prev:j]:
+            armed = True
         if armed:
             out.append(j)
-        end = flips[k + 1] if k + 1 < len(flips) else len(states)
-        armed = "rolling" in states[j:end]
+            armed = False
+        prev = j
     return out
 
 
@@ -728,8 +734,8 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=(),
                 cv2.polylines(frame, [e.astype(np.int32)], False,
                               (235, 235, 235), 3, cv2.LINE_AA)
         # focus lane on top, undimmed: neon speed color, bigger, thick
-        # white outline, heavier trail - blended at FOCUS_ALPHA so the
-        # vehicle underneath stays visible
+        # white outline, heavier trail - outline/trail at FOCUS_ALPHA,
+        # inner fill one notch more transparent (FOCUS_FILL)
         if focus_ops:
             ov = frame.copy()
             for fpts, col, r, trail_ok in focus_ops:
@@ -738,9 +744,13 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=(),
                                   cv2.LINE_AA)
                 cv2.circle(ov, tuple(fpts[-1]), r + FOCUS_RING_W // 2 + 1,
                            (255, 255, 255), FOCUS_RING_W, cv2.LINE_AA)
-                cv2.circle(ov, tuple(fpts[-1]), r, col, -1, cv2.LINE_AA)
             frame = cv2.addWeighted(ov, FOCUS_ALPHA, frame,
                                     1 - FOCUS_ALPHA, 0)
+            ov = frame.copy()
+            for fpts, col, r, trail_ok in focus_ops:
+                cv2.circle(ov, tuple(fpts[-1]), r, col, -1, cv2.LINE_AA)
+            frame = cv2.addWeighted(ov, FOCUS_FILL, frame,
+                                    1 - FOCUS_FILL, 0)
         for f0, ex, ey in focus_rings:
             if f0 <= i < f0 + ring_n:
                 age = (i - f0) / ring_n

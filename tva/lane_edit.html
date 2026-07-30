@@ -49,11 +49,20 @@
       </span>detection dropout</span>
     <span><span class="dot" style="background:#25d36688;border:2px dashed #fff">
       </span>backfilled (render-added, held position)</span>
+    <span><span class="dot" style="background:rgb(60,200,90);border:2px solid #fff">
+      </span>rolling</span>
+    <span><span class="dot" style="background:rgb(235,170,50);border:2px solid #fff">
+      </span>braking</span>
+    <span><span class="dot" style="background:rgb(235,60,50);border:2px solid #fff">
+      </span>stopped</span>
     <br><span class="k">click a car = toggle loud &nbsp;&bull;&nbsp;
       shift-click = place a point for a missed car (keep shift-clicking it
       across frames; Esc = finish that car, click its dot = edit again,
       Del = remove point at this frame) &nbsp;&bull;&nbsp;
-      hover = id + path &nbsp;&bull;&nbsp; &larr;/&rarr; step
+      hover a loud car + <b>1</b>/<b>2</b>/<b>3</b> = pin
+      rolling/braking/stopped from this frame (holds until the engine's
+      next change), <b>0</b> = clear its pins &nbsp;&bull;&nbsp;
+      hover = id + state + path &nbsp;&bull;&nbsp; &larr;/&rarr; step
       (shift = &times;10) &nbsp;&bull;&nbsp; space = play &nbsp;&bull;&nbsp;
       Ctrl-S = save</span>
     <div class="k" id="cmd" style="padding-top:4px"></div>
@@ -62,8 +71,13 @@
 <script>
 let D, scale, frame = 0, playing = false, dirty = false;
 let include = new Set(), exclude = new Set(), band = new Set();
-let byFrame = [], hoverId = null;
+let byFrame = [], hoverId = null, trackById = new Map();
 let manual = [], activeM = null, nextMid = -1;
+let pins = new Map(), pinVer = 0;   // track id -> [[frame, "r"|"b"|"s"]]
+const SC = { r: "rgb(60,200,90)", b: "rgb(235,170,50)",
+             s: "rgb(235,60,50)" };
+const NAME2CODE = { rolling: "r", braking: "b", stopped: "s" };
+const CODE2NAME = { r: "rolling", b: "braking", s: "stopped" };
 const imgs = new Map();          // frame -> Image (browser-side cache)
 const cv = document.getElementById("cv");
 const ctx = cv.getContext("2d");
@@ -119,6 +133,42 @@ function color(v) {
     ? `rgb(${lerp(225,240)},${lerp(45,160)},${lerp(35,25)})`
     : `rgb(${lerp(240,45)},${lerp(160,205)},${lerp(25,70)})`;
 }
+// displayed states: engine states with the hand pins applied, sticky from
+// each pin's frame until the engine's own next state change (mirrors
+// tva/overrides.py). Cached per track, invalidated by pinVer.
+function dispStates(tr) {
+  if (tr._dv === pinVer) return tr._ds;
+  const out = tr.es.split(""), F = tr.f;
+  const ch = [];
+  for (let i = 1; i < out.length; i++)
+    if (out[i] !== out[i - 1]) ch.push(i);
+  for (const [pf, st] of [...(pins.get(tr.id) || [])]
+      .sort((a, b) => a[0] - b[0])) {
+    const k = F.findIndex(f => f >= pf);
+    if (k < 0) continue;
+    let end = out.length;
+    for (const i of ch) if (i > k) { end = i; break; }
+    out.fill(st, k, end);
+  }
+  tr._ds = out; tr._dv = pinVer;
+  return out;
+}
+// ring frames: commits to stopped on the displayed sequence, re-armed only
+// by rolling since the last commit (mirrors render.onset_flips)
+function ringsOf(tr) {
+  if (tr._rv === pinVer) return tr._rg;
+  const ds = dispStates(tr), rg = [];
+  let armed = false;
+  for (let i = 1; i < ds.length; i++) {
+    if (ds[i] === "r") armed = true;
+    if (ds[i] === "s" && ds[i - 1] !== "s") {
+      if (armed) rg.push(tr.f[i]);
+      armed = false;
+    }
+  }
+  tr._rg = rg; tr._rv = pinVer;
+  return rg;
+}
 function getImg(f, cb) {
   if (imgs.has(f)) { const im = imgs.get(f);
                      if (im.complete) return im; return null; }
@@ -143,15 +193,35 @@ function draw() {
       ctx.stroke();
     }
     const syn = tr.bf !== undefined && tr.f[k] < tr.bf;
+    const ds = loud && tr.es ? dispStates(tr) : null;
     ctx.beginPath();
     ctx.arc(x, y, (loud ? 11 : 6) + (hov ? 2 : 0), 0, 7);
-    ctx.globalAlpha = syn ? 0.55 : 1;
-    ctx.fillStyle = color(tr.v[k]);
+    ctx.globalAlpha = (syn ? 0.55 : 1) * (ds ? 0.9 : 1);
+    ctx.fillStyle = ds ? SC[ds[k]] : color(tr.v[k]);
     ctx.fill();
     ctx.globalAlpha = 1;
     if (loud) { if (syn) ctx.setLineDash([5, 4]);
                 ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
                 ctx.setLineDash([]); }
+    if (ds) {
+      // onset rings as the render will fire them (pins included)
+      const RINGN = Math.max(1, Math.round(0.7 * D.fps));
+      for (const rf of ringsOf(tr))
+        if (rf <= frame && frame < rf + RINGN) {
+          const age = (frame - rf) / RINGN;
+          ctx.beginPath();
+          ctx.arc(x, y, (40 + 120 * age) * scale, 0, 7);
+          ctx.strokeStyle = `rgba(255,70,60,${1 - 0.5 * age})`;
+          ctx.lineWidth = 3.5;
+          ctx.stroke();
+        }
+      // white tick under the dot where a hand pin starts
+      for (const [pf] of pins.get(tr.id) || [])
+        if (pf === frame) {
+          ctx.fillStyle = "#fff";
+          ctx.fillRect(x - 6, y + 14, 12, 3);
+        }
+    }
   }
   // dropout ghosts: a loud track alive but not detected at this frame
   for (const tr of D.tracks) {
@@ -225,7 +295,7 @@ function pick(ev) {
   for (const [tr, k] of byFrame[frame]) {
     const dx = tr.x[k] * scale - mx, dy = tr.y[k] * scale - my;
     const d = dx * dx + dy * dy;
-    if (d < bd) { bd = d; best = tr; }
+    if (d < bd) { bd = d; best = [tr, k]; }
   }
   return best;
 }
@@ -248,7 +318,10 @@ function setFrame(f) {
 async function save() {
   await fetch("/save", { method: "POST",
     body: JSON.stringify({ include: [...include], exclude: [...exclude],
-      manual: manual.filter(m => m.points.length) }) });
+      manual: manual.filter(m => m.points.length),
+      overrides: [...pins].flatMap(([id, ovs]) =>
+        ovs.map(([f, c]) => ({ track: id, frame: f,
+                                state: CODE2NAME[c] }))) }) });
   dirty = false;
   saveBtn.classList.remove("dirty");
   saveBtn.textContent = "Saved";
@@ -263,6 +336,12 @@ fetch("/data").then(r => r.json()).then(d => {
   manual = d.manual || [];
   nextMid = manual.length
     ? Math.min(-1, Math.min(...manual.map(m => m.id)) - 1) : -1;
+  pins = new Map();
+  for (const o of d.overrides || []) {
+    const a = pins.get(o.track) || [];
+    a.push([o.frame, NAME2CODE[o.state]]);
+    pins.set(o.track, a);
+  }
   cv.width = 1920;
   cv.height = Math.round(d.height * 1920 / d.width / 2) * 2;
   scale = 1920 / d.width;
@@ -270,6 +349,7 @@ fetch("/data").then(r => r.json()).then(d => {
   byFrame = Array.from({ length: d.n_frames }, () => []);
   for (const tr of d.tracks)
     tr.f.forEach((f, k) => { if (f < d.n_frames) byFrame[f].push([tr, k]); });
+  trackById = new Map(d.tracks.map(t => [t.id, t]));
   document.getElementById("cmd").textContent =
     "after saving, re-render:  python3 -m tva render --work " + d.work;
   setFrame(0);
@@ -281,18 +361,27 @@ cv.onclick = ev => {
   if (ev.shiftKey) { addManualPoint(mx / scale, my / scale); return; }
   const m = pickManual(mx, my);
   if (m) { activeM = m; draw(); return; }
-  const t = pick(ev);
-  if (t) toggle(t.id);
+  const pk = pick(ev);
+  if (pk) toggle(pk[0].id);
 };
 cv.onmousemove = ev => {
-  const t = pick(ev);
-  hoverId = t ? t.id : null;
-  if (t) {
+  const pk = pick(ev);
+  hoverId = pk ? pk[0].id : null;
+  if (pk) {
+    const [t, k] = pk;
+    let s = "id " + t.id + (isLoud(t.id) ? "  (loud)" : "") +
+      (t.bf !== undefined && frame < t.bf ? "  (backfilled)" : "");
+    if (t.es && isLoud(t.id)) {
+      s += "  " + CODE2NAME[dispStates(t)[k]];
+      const pv = pins.get(t.id);
+      if (pv && pv.length)
+        s += "  |  pins: " + pv.map(([f, c]) => CODE2NAME[c] + "@" + f)
+          .join(", ");
+    }
     tip.style.display = "block";
     tip.style.left = (ev.clientX - cv.getBoundingClientRect().left + 14) + "px";
     tip.style.top = (ev.clientY - cv.getBoundingClientRect().top - 8) + "px";
-    tip.textContent = "id " + t.id + (isLoud(t.id) ? "  (loud)" : "") +
-      (t.bf !== undefined && frame < t.bf ? "  (backfilled)" : "");
+    tip.textContent = s;
   } else tip.style.display = "none";
   draw();
 };
@@ -319,6 +408,22 @@ document.onkeydown = ev => {
     ev.preventDefault(); save();
   }
   else if (ev.key === "Escape") { activeM = null; draw(); }
+  else if (["0", "1", "2", "3"].includes(ev.key) && hoverId !== null) {
+    // pin the hovered loud car's state at this frame (0 clears its pins)
+    const tr = trackById.get(hoverId);
+    if (tr && tr.es && isLoud(hoverId)) {
+      if (ev.key === "0") pins.delete(hoverId);
+      else {
+        const st = { "1": "r", "2": "b", "3": "s" }[ev.key];
+        const ovs = (pins.get(hoverId) || []).filter(([f]) => f !== frame);
+        ovs.push([frame, st]);
+        pins.set(hoverId, ovs);
+      }
+      pinVer++;
+      markDirty();
+      draw();
+    }
+  }
   else if ((ev.key === "Delete" || ev.key === "Backspace") && activeM) {
     const i = activeM.points.findIndex(p => p[0] === frame);
     if (i >= 0) activeM.points.splice(i, 1);
