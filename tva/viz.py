@@ -86,8 +86,8 @@ def _focus_rows(ws, monotonic_wave=False):
     """
     from .render import (backfill_focus, focus_lane_ids, focus_states,
                          guide_frame, hidden_ids, lane_guide_path,
-                         locate_on_guide, manual_world, order_wave,
-                         stitch_focus)
+                         locate_on_guide, manual_world, onset_flips,
+                         order_wave, stitch_focus)
 
     meta = ws.meta
     fps = meta["fps"]
@@ -115,8 +115,11 @@ def _focus_rows(ws, monotonic_wave=False):
                    (meta["width"], meta["height"]),
                    set(spec.get("no_backfill", [])))
     gf = guide_frame(guide)
-    state_of = {tr["id"]: focus_states(tr["speed"], fps, v_stop, v_move)
-                for tr in wt["tracks"] if tr["id"] in focus}
+    state_of = {}
+    for tr in wt["tracks"]:
+        if tr["id"] in focus:
+            states, flips = focus_states(tr["speed"], fps, v_stop, v_move)
+            state_of[tr["id"]] = (states, onset_flips(states, flips))
     if monotonic_wave:
         order_wave(wt, state_of, gf)
 

@@ -449,6 +449,19 @@ def focus_states(speed, fps, v_stop, v_move):
     return states, flips
 
 
+def onset_flips(states, flips):
+    """Stop commits that earn a ring/pop: the first, and any later one only
+    if the car has rolled (green) again since the previous commit. A
+    red->amber->red wobble is the same stop, not a new onset."""
+    out, armed = [], True
+    for k, j in enumerate(flips):
+        if armed:
+            out.append(j)
+        end = flips[k + 1] if k + 1 < len(flips) else len(states)
+        armed = "rolling" in states[j:end]
+    return out
+
+
 def order_wave(wt, state_of, gf):
     """Make the stop front continuous IN SPACE: ordered by station along
     the lane, a car may not commit to stopped before its downstream
@@ -559,9 +572,13 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=(),
     if focus:
         print(f"{len(focus)} vehicles in focus lane")
         # quantize each focus car to rolling/braking/stopped AFTER the
-        # recovery passes, so states line up with the final speed arrays
-        state_of = {tr["id"]: focus_states(tr["speed"], fps, v_stop, v_move)
-                    for tr in wt["tracks"] if tr["id"] in focus}
+        # recovery passes, so states line up with the final speed arrays;
+        # rings/pops fire on onset flips only (re-armed by rolling again)
+        state_of = {}
+        for tr in wt["tracks"]:
+            if tr["id"] in focus:
+                states, flips = focus_states(tr["speed"], fps, v_stop, v_move)
+                state_of[tr["id"]] = (states, onset_flips(states, flips))
         if guide is not None and monotonic_wave:
             order_wave(wt, state_of, gf)
     pop_n = max(1, int(POP_S * fps))
