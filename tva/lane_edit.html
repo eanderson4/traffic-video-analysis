@@ -49,12 +49,7 @@
       </span>detection dropout</span>
     <span><span class="dot" style="background:#25d36688;border:2px dashed #fff">
       </span>backfilled (render-added, held position)</span>
-    <span><span class="dot" style="background:rgb(60,200,90);border:2px solid #fff">
-      </span>rolling</span>
-    <span><span class="dot" style="background:rgb(235,170,50);border:2px solid #fff">
-      </span>braking</span>
-    <span><span class="dot" style="background:rgb(235,60,50);border:2px solid #fff">
-      </span>stopped</span>
+    <span id="stateLegend"></span>
     <br><span class="k">click a car = toggle loud &nbsp;&bull;&nbsp;
       shift-click = place a point for a missed car (keep shift-clicking it
       across frames; Esc = finish that car, click its dot = edit again,
@@ -73,11 +68,10 @@ let D, scale, frame = 0, playing = false, dirty = false;
 let include = new Set(), exclude = new Set(), band = new Set();
 let byFrame = [], hoverId = null, trackById = new Map();
 let manual = [], activeM = null, nextMid = -1;
-let pins = new Map(), pinVer = 0;   // track id -> [[frame, "r"|"b"|"s"]]
-const SC = { r: "rgb(60,200,90)", b: "rgb(235,170,50)",
-             s: "rgb(235,60,50)" };
-const NAME2CODE = { rolling: "r", braking: "b", stopped: "s" };
-const CODE2NAME = { r: "rolling", b: "braking", s: "stopped" };
+let pins = new Map();            // track id -> [[frame, stateName]]
+// state vocabulary (colors, codes, names) comes from the server via /data
+// (single-sourced in tva/focus.py); the client keeps no copy
+let stateCol = {}, stateName = {};
 const imgs = new Map();          // frame -> Image (browser-side cache)
 const cv = document.getElementById("cv");
 const ctx = cv.getContext("2d");
@@ -133,41 +127,23 @@ function color(v) {
     ? `rgb(${lerp(225,240)},${lerp(45,160)},${lerp(35,25)})`
     : `rgb(${lerp(240,45)},${lerp(160,205)},${lerp(25,70)})`;
 }
-// displayed states: engine states with the hand pins applied, sticky from
-// each pin's frame until the engine's own next state change (mirrors
-// tva/overrides.py). Cached per track, invalidated by pinVer.
-function dispStates(tr) {
-  if (tr._dv === pinVer) return tr._ds;
-  const out = tr.es.split(""), F = tr.f;
-  const ch = [];
-  for (let i = 1; i < out.length; i++)
-    if (out[i] !== out[i - 1]) ch.push(i);
-  for (const [pf, st] of [...(pins.get(tr.id) || [])]
-      .sort((a, b) => a[0] - b[0])) {
-    const k = F.findIndex(f => f >= pf);
-    if (k < 0) continue;
-    let end = out.length;
-    for (const i of ch) if (i > k) { end = i; break; }
-    out.fill(st, k, end);
+// displayed states + onset rings are computed server-side by the same
+// focus.py pipeline the render runs: /data ships them per track, and
+// /preview recomputes them with the unsaved pins. pinReq guards against
+// out-of-order responses when keys are pressed in quick succession.
+let pinReq = 0;
+async function preview() {
+  const q = ++pinReq;
+  const r = await fetch("/preview", { method: "POST",
+    body: JSON.stringify({ pins: [...pins].flatMap(([id, ovs]) =>
+      ovs.map(([f, s]) => [id, f, s])) }) });
+  const d = await r.json();
+  if (q !== pinReq) return;
+  for (const [id, sp] of Object.entries(d.tracks)) {
+    const tr = trackById.get(+id);
+    if (tr) { tr.ss = sp.ss; tr.rings = sp.rings; }
   }
-  tr._ds = out; tr._dv = pinVer;
-  return out;
-}
-// ring frames: commits to stopped on the displayed sequence, re-armed only
-// by rolling since the last commit (mirrors render.onset_flips)
-function ringsOf(tr) {
-  if (tr._rv === pinVer) return tr._rg;
-  const ds = dispStates(tr), rg = [];
-  let armed = false;
-  for (let i = 1; i < ds.length; i++) {
-    if (ds[i] === "r") armed = true;
-    if (ds[i] === "s" && ds[i - 1] !== "s") {
-      if (armed) rg.push(tr.f[i]);
-      armed = false;
-    }
-  }
-  tr._rg = rg; tr._rv = pinVer;
-  return rg;
+  draw();
 }
 function getImg(f, cb) {
   if (imgs.has(f)) { const im = imgs.get(f);
@@ -193,25 +169,25 @@ function draw() {
       ctx.stroke();
     }
     const syn = tr.bf !== undefined && tr.f[k] < tr.bf;
-    const ds = loud && tr.es ? dispStates(tr) : null;
+    const ss = loud ? tr.ss : null;
     ctx.beginPath();
     ctx.arc(x, y, (loud ? 11 : 6) + (hov ? 2 : 0), 0, 7);
-    ctx.globalAlpha = (syn ? 0.55 : 1) * (ds ? 0.9 : 1);
-    ctx.fillStyle = ds ? SC[ds[k]] : color(tr.v[k]);
+    ctx.globalAlpha = (syn ? 0.55 : 1) * (ss ? 0.9 : 1);
+    ctx.fillStyle = ss ? stateCol[ss[k]] : color(tr.v[k]);
     ctx.fill();
     ctx.globalAlpha = 1;
     if (loud) { if (syn) ctx.setLineDash([5, 4]);
                 ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.stroke();
                 ctx.setLineDash([]); }
-    if (ds) {
-      // onset rings as the render will fire them (pins included)
-      const RINGN = Math.max(1, Math.round(0.7 * D.fps));
-      for (const rf of ringsOf(tr))
+    if (ss) {
+      // onset rings exactly as the render will fire them (pins included)
+      const RINGN = Math.max(1, Math.round(D.ring.secs * D.fps));
+      for (const rf of tr.rings || [])
         if (rf <= frame && frame < rf + RINGN) {
           const age = (frame - rf) / RINGN;
           ctx.beginPath();
-          ctx.arc(x, y, (40 + 120 * age) * scale, 0, 7);
-          ctx.strokeStyle = `rgba(255,70,60,${1 - 0.5 * age})`;
+          ctx.arc(x, y, (D.ring.r0 + D.ring.r1 * age) * scale, 0, 7);
+          ctx.strokeStyle = `rgba(255,70,60,${1 - D.ring.fade * age})`;
           ctx.lineWidth = 3.5;
           ctx.stroke();
         }
@@ -320,15 +296,16 @@ async function save() {
     body: JSON.stringify({ include: [...include], exclude: [...exclude],
       manual: manual.filter(m => m.points.length),
       overrides: [...pins].flatMap(([id, ovs]) =>
-        ovs.map(([f, c]) => ({ track: id, frame: f,
-                                state: CODE2NAME[c] }))) }) });
+        ovs.map(([f, s]) => ({ track: id, frame: f, state: s }))) }) });
   dirty = false;
   saveBtn.classList.remove("dirty");
   saveBtn.textContent = "Saved";
   setTimeout(() => { if (!dirty) saveBtn.textContent = "Save"; }, 1200);
+  // the server rebuilt its context on save: refetch so newly loud cars
+  // get their states/rings (and can be pinned) without a manual reload
+  await reload();
 }
-
-fetch("/data").then(r => r.json()).then(d => {
+function applyData(d) {
   D = d;
   band = new Set(d.band);
   include = new Set(d.include);
@@ -339,9 +316,18 @@ fetch("/data").then(r => r.json()).then(d => {
   pins = new Map();
   for (const o of d.overrides || []) {
     const a = pins.get(o.track) || [];
-    a.push([o.frame, NAME2CODE[o.state]]);
+    a.push([o.frame, o.state]);
     pins.set(o.track, a);
   }
+  stateCol = {}; stateName = {};
+  for (const [nm, s] of Object.entries(d.states)) {
+    stateCol[s.code] = `rgb(${s.rgb.join(",")})`;
+    stateName[s.code] = nm;
+  }
+  document.getElementById("stateLegend").innerHTML =
+    Object.entries(d.states).map(([nm, s]) =>
+      `<span><span class="dot" style="background:rgb(${s.rgb.join(",")});` +
+      `border:2px solid #fff"></span>${nm}</span>`).join("");
   cv.width = 1920;
   cv.height = Math.round(d.height * 1920 / d.width / 2) * 2;
   scale = 1920 / d.width;
@@ -352,6 +338,18 @@ fetch("/data").then(r => r.json()).then(d => {
   trackById = new Map(d.tracks.map(t => [t.id, t]));
   document.getElementById("cmd").textContent =
     "after saving, re-render:  python3 -m tva render --work " + d.work;
+}
+async function reload() {
+  const keepFrame = frame, keepActive = activeM && activeM.id;
+  const d = await (await fetch("/data")).json();
+  applyData(d);
+  if (keepActive !== null && keepActive !== false)
+    activeM = manual.find(m => m.id === keepActive) || null;
+  setFrame(keepFrame);
+}
+
+fetch("/data").then(r => r.json()).then(d => {
+  applyData(d);
   setFrame(0);
 });
 
@@ -371,12 +369,11 @@ cv.onmousemove = ev => {
     const [t, k] = pk;
     let s = "id " + t.id + (isLoud(t.id) ? "  (loud)" : "") +
       (t.bf !== undefined && frame < t.bf ? "  (backfilled)" : "");
-    if (t.es && isLoud(t.id)) {
-      s += "  " + CODE2NAME[dispStates(t)[k]];
+    if (t.ss && isLoud(t.id)) {
+      s += "  " + stateName[t.ss[k]];
       const pv = pins.get(t.id);
       if (pv && pv.length)
-        s += "  |  pins: " + pv.map(([f, c]) => CODE2NAME[c] + "@" + f)
-          .join(", ");
+        s += "  |  pins: " + pv.map(([f, c]) => c + "@" + f).join(", ");
     }
     tip.style.display = "block";
     tip.style.left = (ev.clientX - cv.getBoundingClientRect().left + 14) + "px";
@@ -411,17 +408,16 @@ document.onkeydown = ev => {
   else if (["0", "1", "2", "3"].includes(ev.key) && hoverId !== null) {
     // pin the hovered loud car's state at this frame (0 clears its pins)
     const tr = trackById.get(hoverId);
-    if (tr && tr.es && isLoud(hoverId)) {
+    if (tr && tr.ss && isLoud(hoverId)) {
       if (ev.key === "0") pins.delete(hoverId);
       else {
-        const st = { "1": "r", "2": "b", "3": "s" }[ev.key];
+        const st = { "1": "rolling", "2": "braking", "3": "stopped" }[ev.key];
         const ovs = (pins.get(hoverId) || []).filter(([f]) => f !== frame);
         ovs.push([frame, st]);
         pins.set(hoverId, ovs);
       }
-      pinVer++;
       markDirty();
-      draw();
+      preview();   // server recomputes states/rings, then draws
     }
   }
   else if ((ev.key === "Delete" || ev.key === "Backspace") && activeM) {

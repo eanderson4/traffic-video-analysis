@@ -79,64 +79,28 @@ def spacetime(ws, out_w=1400, out_h=1000):
 def _focus_rows(ws, monotonic_wave=False):
     """Focus-lane recovery + state pipeline shared by the wave QA outputs.
 
-    Mirrors the render exactly (stitch, backfill, quantized states, and the
-    optional monotonic-wavefront pass), so these views show the states the
-    overlay draws. Returns (meta, rows, s_lo, s_hi) with rows =
+    Runs the exact render path (focus.recover + focus.displayed_states:
+    stitch, backfill, quantized states, hand overrides, onset filtering,
+    and the optional monotonic-wavefront pass), so these views show the
+    states the overlay draws. Returns (meta, rows, s_lo, s_hi) with rows =
     (track, station array, states, flip sample indices) per focus car.
     """
-    from . import overrides
-    from .render import (backfill_focus, focus_lane_ids, focus_states,
-                         guide_frame, hidden_ids, lane_guide_path,
-                         locate_on_guide, manual_world, onset_flips,
-                         order_wave, stitch_focus)
+    from . import focus, overrides
 
-    meta = ws.meta
-    fps = meta["fps"]
-    wt = ws.load("world_tracks.json")
-    v_stop, v_move = wt["v_stop"], wt["v_move"]
-    car_len = wt["car_len_px"]
-    roads = ws.load("roads.json")["roads"]
-    spec = ws.load("focus_lane.json")
-    focus = focus_lane_ids(wt, roads, spec)
-    px_of = {}
-    for tr in ws.load("tracks.json")["tracks"]:
-        px_of[tr["id"]] = {o[0]: (o[1], o[2]) for o in tr["obs"]}
-    Hs = [np.asarray(m) for m in ws.load("homographies.json")["H"]]
-    for m in manual_world(ws, Hs, fps):
-        wt["tracks"].append(m["track"])
-        px_of[m["id"]] = m["px"]
-        focus.add(m["id"])
-    parked = hidden_ids(ws, wt, roads)
-    guide = lane_guide_path(wt, focus, roads, spec, car_len)
-    stitch_focus(wt, focus, guide_frame(guide), car_len, fps, px_of,
-                 set(spec.get("exclude", [])), parked)
-    guide = lane_guide_path(wt, focus, roads, spec, car_len)
-    Hinv = [np.linalg.inv(m) for m in Hs]
-    backfill_focus(wt, focus, car_len, v_stop, px_of, Hinv,
-                   (meta["width"], meta["height"]),
-                   set(spec.get("no_backfill", [])))
-    gf = guide_frame(guide)
-    ovs = overrides.load(ws)
-    state_of = {}
-    for tr in wt["tracks"]:
-        if tr["id"] in focus:
-            states, _ = focus_states(tr["speed"], fps, v_stop, v_move)
-            overrides.apply(states, tr["frames"], ovs.get(tr["id"]))
-            flips = onset_flips(states, overrides.stop_commits(states))
-            state_of[tr["id"]] = (states, flips)
-    if monotonic_wave:
-        order_wave(wt, state_of, gf)
+    ctx = focus.recover(ws)
+    state_of = focus.displayed_states(ctx, overrides.load(ws),
+                                      monotonic_wave)
 
     rows = []
     s_lo, s_hi = np.inf, -np.inf
-    for tr in wt["tracks"]:
-        if tr["id"] not in focus:
+    for tr in ctx.wt["tracks"]:
+        if tr["id"] not in ctx.focus:
             continue
-        s, _ = locate_on_guide(gf, tr["x"], tr["y"])
+        s, _ = focus.locate_on_guide(ctx.gf, tr["x"], tr["y"])
         states, flips = state_of[tr["id"]]
         rows.append((tr, s, states, flips))
         s_lo, s_hi = min(s_lo, s.min()), max(s_hi, s.max())
-    return meta, rows, s_lo, s_hi
+    return ctx.meta, rows, s_lo, s_hi
 
 
 def focus_wave(ws, out_w=1800, out_h=1000, monotonic_wave=False):
@@ -148,7 +112,7 @@ def focus_wave(ws, out_w=1800, out_h=1000, monotonic_wave=False):
     a single diagonal red boundary marching upstream; noise reads as
     speckle off the boundary.
     """
-    from .render import STATE_RGB
+    from .focus import STATE_RGB
 
     meta, rows, s_lo, s_hi = _focus_rows(ws, monotonic_wave)
     fps, n = meta["fps"], meta["n_frames"]
@@ -191,7 +155,7 @@ def wave_video(ws, out_w=1920, out_h=260, monotonic_wave=False):
     Dot color = quantized state, white rings = commit to stopped."""
     import subprocess
 
-    from .render import STATE_RGB
+    from .focus import STATE_RGB
 
     meta, rows, s_lo, s_hi = _focus_rows(ws, monotonic_wave)
     fps, n = meta["fps"], meta["n_frames"]

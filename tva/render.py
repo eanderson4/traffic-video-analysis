@@ -12,11 +12,18 @@ import cv2
 import numpy as np
 
 from . import overrides
+# the focus-lane pipeline (recovery, state quantization, ring params) lives
+# in focus.py; re-exported here so existing `from .render import X` users
+# keep working
+from .focus import (RING_FADE, RING_R0, RING_R1, RING_S, STATE_RGB,
+                    backfill_focus, displayed_states, focus_lane_ids,
+                    focus_states, guide_frame, hidden_ids, lane_guide_path,
+                    locate_on_guide, manual_world, onset_flips, order_wave,
+                    recover, stitch_focus)
 from .stabilize import apply_h
 from .viz import speed_color
 
 TRAIL_S = 1.2          # seconds of path behind each car
-RING_S = 0.7           # stop-onset ring duration
 LAYER_ALPHA = 0.8      # overlay blend
 GAP_FILL_S = 0.6       # bridge detection dropouts up to this long
 R_MAX = 40             # marker radius cap (src-frame px)
@@ -34,18 +41,8 @@ CORRIDOR_PAD = 15      # corridor clearance beyond the outermost dot centers:
                        # edges hug the loud-dot envelope, minimal dead space
 CORRIDOR_EXT = 2500    # end extension so the edges always exit the frame
 CORRIDOR_DIM = 0.55    # brightness outside the corridor (1.0 = no dim)
-STITCH_GAP_S = 8       # max dropout when chaining early fragments
-BACKFILL_V = 1.5       # x v_stop: "already stopped at first detection"
-STOP_ENTER = 1.0       # x v_stop: candidate stopped below this
-STOP_EXIT = 1.8        # x v_stop: leave stopped only above this, sustained
-BRAKE_ENTER = 1.7      # x v_move: candidate braking below this
-BRAKE_EXIT = 2.2       # x v_move: back to rolling only above this
-STATE_DEB_S = 0.2      # a new state must hold this long to commit
 POP_S = 0.4            # dot pop duration when a focus car commits to stopped
 POP_SCALE = 1.4        # peak pop radius multiplier
-# quantized focus-lane states; RGB matching the continuous ramp's anchors
-STATE_RGB = {"rolling": (60, 200, 90), "braking": (235, 170, 50),
-             "stopped": (235, 60, 50)}
 
 # per-road hues (BGR), cycled
 ROAD_COLORS = [(255, 91, 46), (255, 200, 0), (180, 0, 255), (0, 200, 255),
@@ -99,285 +96,6 @@ def draw_roads(layer, roads, Hinv_i):
             cv2.polylines(layer, [fpts], False, col, 3, cv2.LINE_AA)
 
 
-def focus_lane_ids(wt, roads, spec):
-    """Track ids riding the hand-picked lane in focus_lane.json: median
-    signed offset from the road centerline inside spec's offset_band."""
-    road = roads[spec["road"]]
-    rx, ry = np.asarray(road["x"]), np.asarray(road["y"])
-    tang = np.gradient(np.column_stack([rx, ry]), axis=0)
-    tang /= np.maximum(np.hypot(tang[:, 0], tang[:, 1])[:, None], 1e-9)
-    nrm = np.column_stack([-tang[:, 1], tang[:, 0]])
-    lo, hi = spec["offset_band"]
-    ids = set(spec.get("include", []))
-    for tr in wt["tracks"]:
-        x, y = np.asarray(tr["x"]), np.asarray(tr["y"])
-        d2 = (rx[None, :] - x[:, None]) ** 2 + (ry[None, :] - y[:, None]) ** 2
-        j = d2.argmin(axis=1)
-        if np.median(np.sqrt(d2[np.arange(len(x)), j])) > spec["max_dist"]:
-            continue
-        off = np.median((x - rx[j]) * nrm[j, 0] + (y - ry[j]) * nrm[j, 1])
-        if lo <= off <= hi:
-            ids.add(tr["id"])
-    return ids - set(spec.get("exclude", []))
-
-
-def hidden_ids(ws, wt, roads):
-    """Parked/scenery tracks the render never paints.
-
-    statics.json: hand-enforced known-fixed zones (parking lots, depots) in
-    world px — registration extrapolation drifts in off-plane corners, so
-    parked cars there read fake speeds no automatic static test catches.
-    Plus static-and-off-every-road culling: that "speed" is pure
-    registration noise, so they twitch with color.
-    """
-    parked = set()
-    try:
-        zones = ws.load("statics.json")["zones"]
-    except FileNotFoundError:
-        zones = []
-    if zones:
-        from matplotlib.path import Path
-        paths = [Path(z["polygon"]) for z in zones]
-        for tr in wt["tracks"]:
-            p = (np.median(tr["x"]), np.median(tr["y"]))
-            if any(pt.contains_point(p) for pt in paths):
-                parked.add(tr["id"])
-        print(f"{len(parked)} vehicles inside static zones hidden")
-    if roads:
-        from .kinematics import station_of
-        for tr in wt["tracks"]:
-            if not tr.get("static"):
-                continue
-            mx = np.array([np.median(tr["x"])])
-            my = np.array([np.median(tr["y"])])
-            dmin = min(station_of(r["x"], r["y"], mx, my)[1][0]
-                       for r in roads)
-            if dmin > 3.5 * wt["car_len_px"]:
-                parked.add(tr["id"])
-        print(f"{len(parked)} parked vehicles hidden")
-    return parked
-
-
-def manual_world(ws, Hs, fps):
-    """Hand-annotated cars from the lane editor (manual_tracks.json):
-    keyframe image-px points, linearly interpolated per frame, lifted to
-    world via the per-frame homography; speed from the smoothed world path.
-    """
-    try:
-        man = ws.load("manual_tracks.json")["tracks"]
-    except FileNotFoundError:
-        return []
-    out = []
-    for m in man:
-        pts = sorted(map(tuple, m["points"]))
-        if not pts:
-            continue
-        px = {pts[0][0]: (pts[0][1], pts[0][2])}
-        for (fa, xa, ya), (fb, xb, yb) in zip(pts, pts[1:]):
-            for f in range(fa, fb + 1):
-                t = (f - fa) / (fb - fa) if fb > fa else 0.0
-                px[f] = (xa + (xb - xa) * t, ya + (yb - ya) * t)
-        F = sorted(px)
-        w = np.array([apply_h(Hs[f], [px[f]])[0] for f in F])
-        sm = w.copy()
-        if len(w) > 7:
-            k = np.ones(7) / 7
-            sm = np.column_stack([np.convolve(w[:, i], k, "same")
-                                  for i in (0, 1)])
-            sm[:3], sm[-3:] = w[:3], w[-3:]
-        d = np.gradient(sm, axis=0) if len(w) > 1 else np.zeros_like(w)
-        sp = (np.hypot(d[:, 0], d[:, 1]) * fps).tolist()
-        out.append({"track": {"id": m["id"], "frames": F,
-                              "x": w[:, 0].tolist(), "y": w[:, 1].tolist(),
-                              "speed": sp},
-                    "id": m["id"], "px": px})
-    return out
-
-
-def lane_guide_path(wt, focus, roads, spec, car_len):
-    """World-plane centerline of the focus lane, fitted from the selected
-    cars' paths: bin their world points by station along the road, median
-    per bin, light smoothing."""
-    road = roads[spec["road"]]
-    rx, ry = np.asarray(road["x"]), np.asarray(road["y"])
-    s_cum = np.concatenate(
-        [[0], np.cumsum(np.hypot(np.diff(rx), np.diff(ry)))])
-    S, X, Y = [], [], []
-    for tr in wt["tracks"]:
-        if tr["id"] not in focus:
-            continue
-        x, y = np.asarray(tr["x"]), np.asarray(tr["y"])
-        d2 = (rx[None, :] - x[:, None]) ** 2 + (ry[None, :] - y[:, None]) ** 2
-        j = d2.argmin(axis=1)
-        S.extend(s_cum[j])
-        X.extend(x)
-        Y.extend(y)
-    if not S:
-        return None
-    S, X, Y = map(np.asarray, (S, X, Y))
-    step = car_len / 2
-    p = []
-    for b in np.arange(S.min(), S.max() + step, step):
-        sel = (S >= b) & (S < b + step)
-        if sel.sum() >= 6:
-            p.append((np.median(X[sel]), np.median(Y[sel])))
-    if len(p) < 2:
-        return None
-    p = np.asarray(p)
-    if len(p) > 8:
-        # "valid" trims the sparse noisy end bins instead of keeping them
-        k = np.ones(7) / 7
-        p = np.column_stack([np.convolve(p[:, i], k, "valid")
-                             for i in (0, 1)])
-    return p
-
-
-def guide_frame(guide, step=5.0):
-    """Densified guide polyline + arc-length stations + unit normals, for
-    station/offset queries against the fitted lane."""
-    d = np.hypot(*np.diff(guide, axis=0).T)
-    s = np.concatenate([[0], np.cumsum(d)])
-    si = np.arange(0.0, s[-1] + step, step)
-    g = np.column_stack([np.interp(si, s, guide[:, 0]),
-                         np.interp(si, s, guide[:, 1])])
-    t = np.gradient(g, axis=0)
-    t /= np.maximum(np.hypot(t[:, 0], t[:, 1])[:, None], 1e-9)
-    return g, si, np.column_stack([-t[:, 1], t[:, 0]])
-
-
-def locate_on_guide(gf, x, y):
-    """(station, signed lateral offset) of world points w.r.t. the guide."""
-    g, si, n = gf
-    x, y = np.asarray(x, float), np.asarray(y, float)
-    d2 = (g[None, :, 0] - x[:, None]) ** 2 + (g[None, :, 1] - y[:, None]) ** 2
-    j = d2.argmin(axis=1)
-    off = (x - g[j, 0]) * n[j, 0] + (y - g[j, 1]) * n[j, 1]
-    return si[j], off
-
-
-def stitch_focus(wt, focus, gf, car_len, fps, px_of, exclude, parked):
-    """Chain early track fragments onto focus-lane tracks.
-
-    The oblique early view fragments tracks: the same physical car carries
-    a throwaway id until detection stabilizes, then gets a fresh one. For
-    each focus track, walk backwards through candidate fragments (real
-    detections, on the lane, continuous in time and position) and merge
-    them in; the focus gap bridge then interpolates across the joins."""
-    by_id = {tr["id"]: tr for tr in wt["tracks"]}
-    max_gap = int(STITCH_GAP_S * fps)
-    used = set()
-    for fid in sorted(focus & set(by_id),
-                      key=lambda t: by_id[t]["frames"][0]):
-        if fid < 0 or fid in used or fid not in focus:
-            continue
-        tr = by_id[fid]
-        while tr["frames"][0] > 0:
-            f0 = tr["frames"][0]
-            p0 = np.array([tr["x"][0], tr["y"][0]])
-            k = min(10, len(tr["frames"]) - 1)
-            vel = (np.array([tr["x"][k], tr["y"][k]]) - p0) \
-                / max(tr["frames"][k] - f0, 1)
-            off0 = locate_on_guide(gf, [p0[0]], [p0[1]])[1][0]
-            best = None
-            for c in wt["tracks"]:
-                cid = c["id"]
-                if (cid == fid or cid in used or cid in exclude
-                        or cid in parked):
-                    continue
-                # manual cars (negative ids) are hand-placed history for a
-                # later real track: any length, any gap - the annotator
-                # says the car was there
-                if cid >= 0 and len(c["frames"]) < 3:
-                    continue
-                fc = c["frames"][-1]
-                if not (0 < f0 - fc and
-                        (cid < 0 or f0 - fc <= max_gap)):
-                    continue
-                pc = np.array([c["x"][-1], c["y"][-1]])
-                if abs(locate_on_guide(gf, [pc[0]], [pc[1]])[1][0]
-                       - off0) > 25:
-                    continue
-                # where was this car at fc? back-extrapolate its own entry
-                # velocity; a jammed car predicts (essentially) in place
-                d = float(np.hypot(*(pc - (p0 - vel * (f0 - fc)))))
-                if d <= max(0.8 * car_len,
-                            0.3 * np.hypot(*vel) * (f0 - fc)):
-                    if best is None or d < best[0]:
-                        best = (d, c)
-            if best is None:
-                break
-            c = best[1]
-            used.add(c["id"])
-            sp = list(c["speed"])
-            if c["id"] < 0 and len(sp) == 1:
-                # a single-keyframe manual car carries no speed of its own;
-                # inherit the entry speed of the track it becomes
-                sp = [tr["speed"][0]]
-            tr["frames"] = list(c["frames"]) + list(tr["frames"])
-            tr["x"] = list(c["x"]) + list(tr["x"])
-            tr["y"] = list(c["y"]) + list(tr["y"])
-            tr["speed"] = sp + list(tr["speed"])
-            px_of[fid].update(px_of[c["id"]])
-            focus.discard(c["id"])
-    if used:
-        wt["tracks"] = [t for t in wt["tracks"] if t["id"] not in used]
-        print(f"stitched {len(used)} early fragments into focus tracks")
-    return used
-
-
-def backfill_focus(wt, focus, car_len, v_stop, px_of, Hinv, wh, skip):
-    """Hold near-stationary focus cars at their first observed position
-    back to frame 0. The early oblique view misses cars deep in the queue;
-    a jammed car barely moves, so where detection eventually locks on is
-    where the car has been sitting all along. Cars still moving at first
-    detection genuinely arrived (or merged in) and get no synthetic
-    history - that is what fragment stitching and manual keyframes are
-    for."""
-    w, h = wh
-    occ = {}    # frame -> world positions of focus cars, for dedup
-    for tr in wt["tracks"]:
-        if tr["id"] in focus:
-            for f, x, y in zip(tr["frames"], tr["x"], tr["y"]):
-                occ.setdefault(f, []).append((x, y))
-    n_fill = 0
-    for tr in wt["tracks"]:
-        tid = tr["id"]
-        f0 = tr["frames"][0]
-        if tid not in focus or tid < 0 or tid in skip or f0 == 0:
-            continue
-        v0 = float(np.median(tr["speed"][:10]))
-        if v0 > BACKFILL_V * v_stop:
-            continue
-        x0, y0 = tr["x"][0], tr["y"][0]
-        # anchor: keep the drawn dot continuous with the detection at f0
-        det = px_of[tid].get(f0)
-        delta = (np.asarray(det, float)
-                 - apply_h(Hinv[f0], [(x0, y0)])[0]
-                 if det is not None else np.zeros(2))
-        add = []
-        for f in range(f0 - 1, -1, -1):
-            if any((x - x0) ** 2 + (y - y0) ** 2 < (0.65 * car_len) ** 2
-                   for x, y in occ.get(f, [])):
-                break
-            p = apply_h(Hinv[f], [(x0, y0)])[0] + delta
-            if not (-40 <= p[0] <= w + 40 and -40 <= p[1] <= h + 40):
-                break
-            add.append((f, p))
-        if not add:
-            continue
-        add.reverse()
-        tr["frames"] = [f for f, _ in add] + list(tr["frames"])
-        tr["x"] = [x0] * len(add) + list(tr["x"])
-        tr["y"] = [y0] * len(add) + list(tr["y"])
-        tr["speed"] = [v0] * len(add) + list(tr["speed"])
-        for f, p in add:
-            px_of[tid][f] = (float(p[0]), float(p[1]))
-            occ.setdefault(f, []).append((x0, y0))
-        n_fill += 1
-    if n_fill:
-        print(f"backfilled {n_fill} queued cars to their first frames")
-
-
 def lane_corridor(guide, lo=-CORRIDOR_HW, hi=CORRIDOR_HW):
     """Two world-plane edge polylines bracketing the focus lane: the
     fitted guide centerline offset to lo/hi, ends extended along their
@@ -406,194 +124,64 @@ def neon(col):
     return tuple(int(c) for c in cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0])
 
 
-def focus_states(speed, fps, v_stop, v_move):
-    """Quantize a focus car's smoothed speed into rolling/braking/stopped.
-
-    The continuous ramp leaves cars hovering in amber and flickering with
-    measurement noise; the wave wants crisp hand-offs. Hysteresis bands
-    (enter vs exit thresholds off v_stop/v_move) plus a debounce (the
-    candidate state must hold STATE_DEB_S) make each car flip to solid red
-    once, crisply, and not flicker back. Symmetric both ways: a car that
-    rolls again walks back amber then green. Returns (state per sample,
-    sample indices where the state commits to stopped)."""
-    s_in, s_out = STOP_ENTER * v_stop, STOP_EXIT * v_stop
-    b_in, b_out = BRAKE_ENTER * v_move, BRAKE_EXIT * v_move
-    deb = max(1, int(STATE_DEB_S * fps))
-
-    def classify(v, st):
-        if st == "stopped":
-            return st if v <= s_out else (
-                "braking" if v <= b_out else "rolling")
-        if st == "braking":
-            return "stopped" if v < s_in else (
-                st if v <= b_out else "rolling")
-        return "stopped" if v < s_in else ("braking" if v < b_in else st)
-
-    v0 = speed[0] if speed else 0.0
-    st = "stopped" if v0 < s_in else ("braking" if v0 < b_in else "rolling")
-    states, flips = [], []
-    pend, cnt = None, 0
-    for v in speed:
-        # classify against the PENDING state once a transition starts, so
-        # the hysteresis band keeps it alive: entry begins past the enter
-        # threshold and holds anywhere this side of the exit threshold
-        tgt = classify(v, pend if pend is not None else st)
-        if tgt == st:
-            pend, cnt = None, 0
-        elif tgt == pend:
-            cnt += 1
-            if cnt >= deb:
-                if tgt == "stopped":
-                    flips.append(len(states))
-                st, pend, cnt = tgt, None, 0
-        else:
-            pend, cnt = tgt, 1
-        states.append(st)
-    return states, flips
-
-
-def onset_flips(states, flips):
-    """Stop commits that earn a ring/pop. A commit rings only if the car
-    has ROLLED (green) at some point since the previous commit — or ever,
-    for the first one. A car that has never been green never rings: a
-    start-red -> amber -> red wobble is the same stop, not an onset."""
-    out, armed = [], False
-    prev = 0
-    for j in flips:
-        if "rolling" in states[prev:j]:
-            armed = True
-        if armed:
-            out.append(j)
-            armed = False
-        prev = j
-    return out
-
-
-def order_wave(wt, state_of, gf):
-    """Make the stop front continuous IN SPACE: ordered by station along
-    the lane, a car may not commit to stopped before its downstream
-    neighbor. Cars measured flipping early (queue pockets that pre-date
-    the clip, lumpy decel) hold braking until the front reaches them;
-    their pop/ring moves with the corrected commit. Only first flips are
-    ordered — a genuine restart + re-stop later is its own event."""
-    by_id = {tr["id"]: tr for tr in wt["tracks"]}
-    rows = []
-    for tid, (states, fl) in state_of.items():
-        if fl:
-            tr = by_id[tid]
-            s, _ = locate_on_guide(gf, [tr["x"][fl[0]]],
-                                   [tr["y"][fl[0]]])
-            rows.append((s[0], tid))
-    rows.sort()
-    front = -1
-    n_fix = 0
-    for _, tid in rows:
-        states, fl = state_of[tid]
-        tr = by_id[tid]
-        j = min(np.searchsorted(tr["frames"], max(front, tr["frames"][fl[0]])),
-                len(states) - 1)
-        front = tr["frames"][j]
-        if j > fl[0]:
-            for k in range(fl[0], j):
-                if states[k] == "stopped":
-                    states[k] = "braking"
-            fl[0] = j
-            n_fix += 1
-    if n_fix:
-        print(f"wave order: held {n_fix} early flips to the marching front")
-
-
 def run(ws, out=None, out_w=1920, layers=("cars",), highlight=(),
         monotonic_wave=False):
     meta = ws.meta
     fps, n = meta["fps"], meta["n_frames"]
     w, h = meta["width"], meta["height"]
     out = out or ws.path("overlay-speed.mp4")
-    Hs = [np.asarray(m) for m in ws.load("homographies.json")["H"]]
-    Hinv = [np.linalg.inv(m) for m in Hs]
-    wt = ws.load("world_tracks.json")
+    # focus-lane recovery (manual cars, fragment stitching, queued-car
+    # backfill) is shared with the wave views and the lane editor via
+    # focus.recover, so every consumer draws the same dots
+    ctx = recover(ws)
+    wt = ctx.wt
+    Hinv = ctx.Hinv
     v_stop, v_move = wt["v_stop"], wt["v_move"]
     car_len = wt["car_len_px"]
-    # roads.json is loaded even when the layer is off: parked culling needs it
+    roads = ctx.roads
     roads_draw = "roads" in layers
-    try:
-        roads = ws.load("roads.json")["roads"]
-    except FileNotFoundError:
-        roads = []
-        if roads_draw:
-            print("roads.json missing - run `tva roads` first; skipping layer")
+    if roads_draw and not roads:
+        print("roads.json missing - run `tva roads` first; skipping layer")
+    focus = ctx.focus
+    parked = ctx.parked
+    stitched = ctx.stitched
+    px_of = ctx.px_of
 
-    # per-track median bbox size (frame px) for marker radius, and observed
-    # centers: markers are drawn on the DETECTION, never on the smoothed
-    # world estimate (which coasts away from the car wherever the projection
-    # is too distorted to trust measurements)
-    size_of, px_of = {}, {}
-    for tr in ws.load("tracks.json")["tracks"]:
-        size_of[tr["id"]] = float(np.median([max(o[3], o[4])
-                                             for o in tr["obs"]]))
-        px_of[tr["id"]] = {o[0]: (o[1], o[2]) for o in tr["obs"]}
-
-    # focus_lane.json: hand-picked lane whose cars get the loud styling so
-    # the stop wave marching up one lane is impossible to miss
-    spec = None
-    try:
-        spec = ws.load("focus_lane.json")
-        focus = focus_lane_ids(wt, roads, spec) if roads else set()
-    except FileNotFoundError:
-        focus = set()
-
-    # hand-annotated cars join as full tracks, always in the focus set
-    for m in manual_world(ws, Hs, fps):
-        wt["tracks"].append(m["track"])
-        px_of[m["id"]] = m["px"]
+    # per-track median bbox size (frame px) for marker radius; markers are
+    # drawn on the DETECTION, never on the smoothed world estimate (which
+    # coasts away from the car wherever the projection is too distorted to
+    # trust measurements)
+    size_of = {tr["id"]: float(np.median([max(o[3], o[4])
+                                          for o in tr["obs"]]))
+               for tr in ws.load("tracks.json")["tracks"]}
+    for m in ctx.manual:
         size_of[m["id"]] = 80
-        focus.add(m["id"])
 
-    parked = hidden_ids(ws, wt, roads)
-
+    # spotlight corridor bracketing the loud dots, sized off their actual
+    # offsets: 1st/99th percentile, not true extremes, so one stray loud
+    # dot (an adjacent-lane car passing the offset_band test) can't stretch
+    # the corridor for the whole clip; a 1% trim is ~100 samples here, far
+    # more than any single fragment carries
     corridor = None
-    stitched = set()
-    guide = (lane_guide_path(wt, focus, roads, spec, car_len)
-             if focus and roads and spec else None)
-    if guide is not None:
-        # recover the cars detection loses early: chain real fragments
-        # first, then hold already-stopped cars back to frame 0, then refit
-        # the guide and size the corridor off the actual dot offsets
-        stitched = stitch_focus(wt, focus, guide_frame(guide), car_len, fps,
-                                px_of, set(spec.get("exclude", [])), parked)
-        guide = lane_guide_path(wt, focus, roads, spec, car_len)
-        backfill_focus(wt, focus, car_len, v_stop, px_of, Hinv, (w, h),
-                       set(spec.get("no_backfill", [])))
-        gf = guide_frame(guide)
+    if ctx.guide is not None:
         offs = np.concatenate(
-            [locate_on_guide(gf, tr["x"], tr["y"])[1]
+            [locate_on_guide(ctx.gf, tr["x"], tr["y"])[1]
              for tr in wt["tracks"] if tr["id"] in focus])
-        # 1st/99th percentile, not true extremes: one stray loud dot (an
-        # adjacent-lane car passing the offset_band test) would otherwise
-        # stretch the corridor for the whole clip; a 1% trim is ~100
-        # samples here, far more than any single fragment carries
         corridor = lane_corridor(
-            guide,
+            ctx.guide,
             min(-CORRIDOR_HW, np.percentile(offs, 1) - CORRIDOR_PAD),
             max(CORRIDOR_HW, np.percentile(offs, 99) + CORRIDOR_PAD))
+
+    # quantized rolling/braking/stopped per focus car: engine states, hand
+    # overrides sticky until the engine's next change, rings on
+    # onset-filtered commits of the DISPLAYED sequence - the shared
+    # focus.py pipeline, so the wave views and editor agree with the render
+    state_of = {}
     if focus:
-        print(f"{len(focus)} vehicles in focus lane")
-        # quantize each focus car to rolling/braking/stopped AFTER the
-        # recovery passes, so states line up with the final speed arrays;
-        # hand overrides stick until the engine's next change, and
-        # rings/pops fire on onset flips of the DISPLAYED sequence
         ovs = overrides.load(ws)
         if ovs:
             print(f"{sum(map(len, ovs.values()))} hand state overrides")
-        state_of = {}
-        for tr in wt["tracks"]:
-            if tr["id"] in focus:
-                states, _ = focus_states(tr["speed"], fps, v_stop, v_move)
-                overrides.apply(states, tr["frames"], ovs.get(tr["id"]))
-                flips = onset_flips(states, overrides.stop_commits(states))
-                state_of[tr["id"]] = (states, flips)
-        if guide is not None and monotonic_wave:
-            order_wave(wt, state_of, gf)
+        state_of = displayed_states(ctx, ovs, monotonic_wave)
     pop_n = max(1, int(POP_S * fps))
     # focus onset rings ride the DISPLAYED commits to stopped (state machine
     # plus hand overrides), so ring + pop always coincide with the visible
@@ -755,8 +343,8 @@ def run(ws, out=None, out_w=1920, layers=("cars",), highlight=(),
             if f0 <= i < f0 + ring_n:
                 age = (i - f0) / ring_n
                 p = apply_h(Hinv[i], [(ex, ey)])[0].astype(int)
-                rr = int(40 + 120 * age)
-                c = int(255 * (1 - 0.5 * age))
+                rr = int(RING_R0 + RING_R1 * age)
+                c = int(255 * (1 - RING_FADE * age))
                 cv2.circle(frame, tuple(p), rr, (c, c, 255), 7, cv2.LINE_AA)
         small = cv2.resize(frame, (out_w, out_h))
         enc.stdin.write(small.tobytes())

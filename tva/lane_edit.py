@@ -4,6 +4,12 @@ Serves the clip plus every rendered track's detected centers; click a dot
 to toggle it in/out of the focus set, Save writes include/exclude back to
 focus_lane.json. Clicks are stored as deltas against the offset_band
 baseline, so retuning the band later keeps manual picks intact.
+
+Displayed states and onset rings are computed server-side by the same
+focus.py pipeline the render runs: /data ships them per track, and POST
+/preview recomputes them with the client's unsaved pins. The client keeps
+no state-machine logic of its own, so the editor always shows exactly what
+the next render will draw.
 """
 import json
 import os
@@ -11,95 +17,62 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
-import numpy as np
 
-from .render import (backfill_focus, focus_lane_ids, focus_states,
-                     guide_frame, hidden_ids, lane_guide_path, manual_world,
-                     stitch_focus)
+from . import focus, overrides
 
 VIEW_W = 1920  # frames served to the browser at this width
 
-STATE_CODE = {"rolling": "r", "braking": "b", "stopped": "s"}
+
+def _kept(ctx, tr):
+    """Sample indices with a detected center - the ones the client gets."""
+    px = ctx.px_of.get(tr["id"], {})
+    return [k for k, f in enumerate(tr["frames"]) if f in px]
 
 
-def build_data(ws):
-    meta = ws.meta
-    wt = ws.load("world_tracks.json")
-    try:
-        roads = ws.load("roads.json")["roads"]
-    except FileNotFoundError:
-        roads = []
-    hidden = hidden_ids(ws, wt, roads)
-    try:
-        spec = ws.load("focus_lane.json")
-    except FileNotFoundError:
-        spec = {"road": 0, "offset_band": [0, 0], "max_dist": 0,
-                "include": [], "exclude": []}
-    band = set()
-    if roads:
-        band = focus_lane_ids(wt, roads,
-                              {**spec, "include": [], "exclude": []})
-    px_of = {}
-    for tr in ws.load("tracks.json")["tracks"]:
-        px_of[tr["id"]] = {o[0]: (o[1], o[2]) for o in tr["obs"]}
+def _state_payload(ctx, state_of):
+    """track id -> {"ss": displayed states as a code string aligned with
+    the samples _kept ships, "rings": onset ring frames}."""
+    by_id = {tr["id"]: tr for tr in ctx.wt["tracks"]}
+    out = {}
+    for tid, (states, flips) in state_of.items():
+        tr = by_id[tid]
+        ks = _kept(ctx, tr)
+        kset = set(ks)
+        out[tid] = {
+            "ss": "".join(focus.STATE_CODE[states[k]] for k in ks),
+            "rings": [tr["frames"][j] for j in flips if j in kset],
+        }
+    return out
 
-    # mirror the render's recovery pass (fragment stitching + queued-car
-    # backfill) so the editor shows exactly the dots the render will draw;
-    # backfilled frames are tagged so the client styles them apart
-    first_real = {}
-    eng_states = {}
-    if roads:
-        focus = focus_lane_ids(wt, roads, spec)
-        Hs = [np.asarray(m) for m in ws.load("homographies.json")["H"]]
-        for m in manual_world(ws, Hs, meta["fps"]):
-            wt["tracks"].append(m["track"])
-            px_of[m["id"]] = m["px"]
-            focus.add(m["id"])
-        guide = (lane_guide_path(wt, focus, roads, spec, wt["car_len_px"])
-                 if focus else None)
-        if guide is not None:
-            stitch_focus(wt, focus, guide_frame(guide), wt["car_len_px"],
-                         meta["fps"], px_of,
-                         set(spec.get("exclude", [])), hidden)
-            for tr in wt["tracks"]:
-                if tr["id"] in focus:
-                    first_real[tr["id"]] = tr["frames"][0]
-            Hinv = [np.linalg.inv(m) for m in Hs]
-            backfill_focus(wt, focus, wt["car_len_px"], wt["v_stop"],
-                           px_of, Hinv, (meta["width"], meta["height"]),
-                           set(spec.get("no_backfill", [])))
-            # engine states (pre-override) per focus car; the client
-            # re-derives displayed states/rings as pins are edited
-            for tr in wt["tracks"]:
-                if tr["id"] not in focus:
-                    continue
-                eng, _ = focus_states(tr["speed"], meta["fps"],
-                                      wt["v_stop"], wt["v_move"])
-                eng_states[tr["id"]] = eng
+
+def build_data(ws, ctx):
+    meta = ctx.meta
+    wt = ctx.wt
+    spec = ctx.spec or {}
+    state_of = focus.displayed_states(ctx, overrides.load(ws))
+    states_payload = _state_payload(ctx, state_of)
 
     tracks = []
     for tr in wt["tracks"]:
-        if tr["id"] in hidden or tr["id"] < 0:
+        if tr["id"] in ctx.parked or tr["id"] < 0:
             continue
-        eng = eng_states.get(tr["id"])
-        F, X, Y, V, S = [], [], [], [], []
-        for k, f in enumerate(tr["frames"]):
-            p = px_of.get(tr["id"], {}).get(f)
-            if p is None:
-                continue
+        F, X, Y, V = [], [], [], []
+        for k in _kept(ctx, tr):
+            f = tr["frames"][k]
+            p = ctx.px_of[tr["id"]][f]
             F.append(f)
             X.append(round(p[0]))
             Y.append(round(p[1]))
             V.append(round(tr["speed"][k], 1))
-            if eng is not None:
-                S.append(STATE_CODE[eng[k]])
         if F:
             t = {"id": tr["id"], "f": F, "x": X, "y": Y, "v": V}
-            bf = first_real.get(tr["id"])
+            bf = ctx.first_real.get(tr["id"])
             if bf is not None and F[0] < bf:
                 t["bf"] = bf
-            if eng is not None:
-                t["es"] = "".join(S)          # engine states, pre-override
+            sp = states_payload.get(tr["id"])
+            if sp is not None:
+                t["ss"] = sp["ss"]        # displayed states, pins applied
+                t["rings"] = sp["rings"]  # onset ring frames
             tracks.append(t)
     try:
         man = ws.load("manual_tracks.json")["tracks"]
@@ -115,16 +88,24 @@ def build_data(ws):
         "n_frames": meta["n_frames"], "fps": meta["fps"],
         "width": meta["width"], "height": meta["height"],
         "v_stop": wt["v_stop"], "v_move": wt["v_move"],
-        "band": sorted(band),
+        "band": sorted(ctx.band),
         "include": sorted(spec.get("include", [])),
         "exclude": sorted(spec.get("exclude", [])),
         "overrides": ovs_data.get("overrides", []),
+        # the state vocabulary + ring params, single-sourced from focus.py,
+        # so the client renders them instead of keeping its own copies
+        "states": {s: {"code": focus.STATE_CODE[s],
+                       "rgb": list(focus.STATE_RGB[s])}
+                   for s in overrides.STATES},
+        "ring": {"secs": focus.RING_S, "r0": focus.RING_R0,
+                 "r1": focus.RING_R1, "fade": focus.RING_FADE},
         "tracks": tracks,
     }
 
 
 def run(ws, port=8123):
-    state = {"data": json.dumps(build_data(ws)).encode()}
+    box = {"ctx": focus.recover(ws)}
+    box["data"] = json.dumps(build_data(ws, box["ctx"])).encode()
     with open(os.path.join(os.path.dirname(__file__),
                            "lane_edit.html"), "rb") as fh:
         html = fh.read()
@@ -165,11 +146,15 @@ def run(ws, port=8123):
             self.end_headers()
             self.wfile.write(body)
 
+        def _body(self):
+            return json.loads(
+                self.rfile.read(int(self.headers["Content-Length"])))
+
         def do_GET(self):
             if self.path in ("/", "/index.html"):
                 self._send(200, "text/html", html)
             elif self.path == "/data":
-                self._send(200, "application/json", state["data"])
+                self._send(200, "application/json", box["data"])
             elif self.path.startswith("/frame/"):
                 i = int(self.path.rsplit("/", 1)[1].split(".")[0])
                 i = max(0, min(n - 1, i))
@@ -192,11 +177,24 @@ def run(ws, port=8123):
                 self._send(404, "text/plain", b"not found")
 
         def do_POST(self):
+            if self.path == "/preview":
+                # the client's unsaved pins through the real Python
+                # pipeline (focus.displayed_states) - the client keeps no
+                # state-machine logic of its own
+                body = self._body()
+                ovs = {}
+                for tid, f, st in body.get("pins", []):
+                    if st in overrides.STATES:
+                        ovs.setdefault(tid, []).append((f, st))
+                state_of = focus.displayed_states(box["ctx"], ovs)
+                self._send(200, "application/json", json.dumps(
+                    {"tracks": _state_payload(box["ctx"], state_of)}
+                ).encode())
+                return
             if self.path != "/save":
                 self._send(404, "text/plain", b"not found")
                 return
-            body = json.loads(
-                self.rfile.read(int(self.headers["Content-Length"])))
+            body = self._body()
             try:
                 spec = ws.load("focus_lane.json")
             except FileNotFoundError:
@@ -209,13 +207,15 @@ def run(ws, port=8123):
                 with open(ws.path("manual_tracks.json"), "w") as fh:
                     json.dump({"tracks": body["manual"]}, fh, indent=1)
             if "overrides" in body:
-                with open(ws.path("state_overrides.json"), "w") as fh:
-                    json.dump({"overrides": body["overrides"]}, fh,
-                              indent=1)
+                overrides.save_all(ws, body["overrides"])
             print(f"saved focus_lane.json  include={spec['include']}  "
                   f"exclude={spec['exclude']}  "
                   f"overrides={len(body.get('overrides', []))}")
-            state["data"] = json.dumps(build_data(ws)).encode()
+            # rebuild the recovered context so the next /data reflects the
+            # new focus set (a car just toggled loud gets states and can be
+            # pinned without a manual reload)
+            box["ctx"] = focus.recover(ws)
+            box["data"] = json.dumps(build_data(ws, box["ctx"])).encode()
             self._send(200, "application/json", b'{"ok": true}')
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)

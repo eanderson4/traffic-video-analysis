@@ -10,13 +10,19 @@ STATES = ("rolling", "braking", "stopped")
 
 
 def load(ws):
-    """track id -> sorted [(frame, state)] from state_overrides.json."""
+    """track id -> sorted [(frame, state)] from state_overrides.json.
+    Entries with an unknown state are dropped with a warning — a typo'd
+    state would otherwise survive until STATE_RGB[...] KeyErrors
+    mid-render."""
     try:
         data = ws.load("state_overrides.json")
     except FileNotFoundError:
         return {}
     out = {}
     for o in data.get("overrides", []):
+        if o.get("state") not in STATES:
+            print(f"state_overrides: ignoring bad entry {o}")
+            continue
         out.setdefault(o["track"], []).append((o["frame"], o["state"]))
     for ovs in out.values():
         ovs.sort()
@@ -33,6 +39,8 @@ def _load_edit(ws):
 def add(ws, track, frame, state):
     """Pin `track` to `state` from `frame` on (replaces any pin at that
     frame for that track)."""
+    if state not in STATES:
+        raise ValueError(f"state must be one of {STATES}, got {state!r}")
     data = _load_edit(ws)
     data["overrides"] = [o for o in data["overrides"]
                          if not (o["track"] == track
@@ -40,6 +48,21 @@ def add(ws, track, frame, state):
     data["overrides"].append(
         {"track": track, "frame": frame, "state": state})
     ws.save("state_overrides.json", data)
+
+
+def save_all(ws, ovs):
+    """Replace state_overrides.json with `ovs` ([{track, frame, state}]),
+    dropping entries whose state is unknown (same rule as load). The
+    editor's /save goes through here so a malformed client payload can't
+    plant a state that KeyErrors the next render."""
+    good = []
+    for o in ovs:
+        if o.get("state") not in STATES:
+            print(f"state_overrides: ignoring bad entry {o}")
+            continue
+        good.append({"track": o["track"], "frame": o["frame"],
+                     "state": o["state"]})
+    ws.save("state_overrides.json", {"overrides": good})
 
 
 def remove(ws, track, frame=None):
