@@ -6,3 +6,7 @@ __pycache__/
 work/
 .venv/
 testdata/
+.env
+.env.*
+*.key
+*.pem

@@ -135,6 +135,7 @@ let pinReq = 0;
 async function preview() {
   const q = ++pinReq;
   const r = await fetch("/preview", { method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ pins: [...pins].flatMap(([id, ovs]) =>
       ovs.map(([f, s]) => [id, f, s])) }) });
   const d = await r.json();
@@ -293,6 +294,7 @@ function setFrame(f) {
 }
 async function save() {
   await fetch("/save", { method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ include: [...include], exclude: [...exclude],
       manual: manual.filter(m => m.points.length),
       overrides: [...pins].flatMap(([id, ovs]) =>

@@ -146,17 +146,52 @@ def run(ws, port=8123):
             self.end_headers()
             self.wfile.write(body)
 
+        def _same_origin(self):
+            # loopback server, loopback clients only: blocks cross-origin
+            # form POSTs (CSRF on /save) and DNS-rebinding reads of /data
+            host = self.headers.get("Host", "")
+            if not host.startswith(("127.0.0.1", "localhost", "[::1]")):
+                self._send(403, "text/plain", b"bad host")
+                return False
+            origin = self.headers.get("Origin")
+            if origin and not origin.startswith(
+                    ("http://127.0.0.1", "http://localhost", "http://[::1]")):
+                self._send(403, "text/plain", b"bad origin")
+                return False
+            return True
+
         def _body(self):
-            return json.loads(
-                self.rfile.read(int(self.headers["Content-Length"])))
+            # JSON POST body; sends the error and returns None on bad input
+            if "application/json" not in self.headers.get("Content-Type", ""):
+                self._send(415, "text/plain", b"expected application/json")
+                return None
+            try:
+                n = int(self.headers["Content-Length"])
+            except (TypeError, ValueError):
+                self._send(400, "text/plain", b"bad content-length")
+                return None
+            if n > 16 << 20:
+                self._send(413, "text/plain", b"body too large")
+                return None
+            try:
+                return json.loads(self.rfile.read(n))
+            except (ValueError, UnicodeDecodeError):
+                self._send(400, "text/plain", b"bad json")
+                return None
 
         def do_GET(self):
+            if not self._same_origin():
+                return
             if self.path in ("/", "/index.html"):
                 self._send(200, "text/html", html)
             elif self.path == "/data":
                 self._send(200, "application/json", box["data"])
             elif self.path.startswith("/frame/"):
-                i = int(self.path.rsplit("/", 1)[1].split(".")[0])
+                try:
+                    i = int(self.path.rsplit("/", 1)[1].split(".")[0])
+                except ValueError:
+                    self._send(400, "text/plain", b"bad frame index")
+                    return
                 i = max(0, min(n - 1, i))
                 if i in frames:
                     self._send(200, "image/jpeg", frames[i])
@@ -177,11 +212,15 @@ def run(ws, port=8123):
                 self._send(404, "text/plain", b"not found")
 
         def do_POST(self):
+            if not self._same_origin():
+                return
             if self.path == "/preview":
                 # the client's unsaved pins through the real Python
                 # pipeline (focus.displayed_states) - the client keeps no
                 # state-machine logic of its own
                 body = self._body()
+                if body is None:
+                    return
                 ovs = {}
                 for tid, f, st in body.get("pins", []):
                     if st in overrides.STATES:
@@ -195,6 +234,8 @@ def run(ws, port=8123):
                 self._send(404, "text/plain", b"not found")
                 return
             body = self._body()
+            if body is None:
+                return
             try:
                 spec = ws.load("focus_lane.json")
             except FileNotFoundError:
