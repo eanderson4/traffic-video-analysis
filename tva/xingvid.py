@@ -7,9 +7,10 @@ Three acts:
                         motion can't shake them off), cars as state dots
   RAW_END .. +FADE s    crossfade to the schematic
   .. end                schematic world plane (dark map, lanes as polys,
-                        cars as dots) + per-approach counters (arrived /
-                        queued / total wait) + a ticking timer over every
-                        stopped car
+                        cars as rotated bboxes with heading triangles,
+                        signal heads at the stop bars) + per-approach
+                        counters (arrived / queued / total wait) + a
+                        ticking timer over every stopped car
 
 The schematic lives entirely in the reference plane: camera zoom/drift in
 the source footage vanishes, and everything is driven by the same
@@ -25,6 +26,8 @@ from .stabilize import apply_h
 
 RAW_END_S = 6.0
 FADE_S = 2.0
+SIGNAL_GAP_S = 6.0    # stop-bar crossings closer than this = one green window
+SIGNAL_TAIL_S = 2.0   # window stays green this long past the last crossing
 BG = (18, 18, 22)
 ROAD = (46, 46, 54)
 IN_LINE = (80, 220, 80)      # BGR, greenish
@@ -110,6 +113,34 @@ class Scene:
             self.counters.append(dict(
                 name=ap["name"], arr_t=arr_t, qlen=qlen,
                 wait=np.cumsum(qlen) / self.fps))
+        # signal state per frame: explicit phases if the annotation has
+        # them ({"signal": {"phases": [[t0, t1, "green"|"red"], ...]}}),
+        # else inferred — stop-bar flow within the trailing window = green
+        self.signal = {}
+        for ap, res in zip(self.xing["approaches"], self.approaches):
+            phases = (ap.get("signal") or {}).get("phases")
+            green = np.zeros(self.n, bool)
+            if phases:
+                for t0, t1, st in phases:
+                    if st == "green":
+                        green[int(t0 * self.fps):int(t1 * self.fps)] = True
+            else:
+                # infer green windows: maximal runs of stop-bar crossings
+                # with gaps < GAP_S, extended SIGNAL_TAIL_S past the last
+                # crossing (a lone crossing still flashes green briefly —
+                # someone did enter the junction)
+                dep = np.sort([t for t, _ in res["departures"]])
+                if len(dep):
+                    starts = [0] + [i for i in range(1, len(dep))
+                                    if dep[i] - dep[i - 1] > SIGNAL_GAP_S]
+                    for si, s in enumerate(starts):
+                        e = (starts[si + 1] - 1
+                             if si + 1 < len(starts) else len(dep) - 1)
+                        f0 = int(dep[s] * self.fps)
+                        f1 = min(int((dep[e] + SIGNAL_TAIL_S) * self.fps) + 1,
+                                 self.n)
+                        green[f0:f1] = True
+            self.signal[ap["name"]] = green
 
     def active_waits(self, t):
         for tid, t0, t1 in self.waits:
@@ -165,24 +196,75 @@ def draw_schematic(scn, f, to_px, scale):
             cv2.line(img, tuple(a), tuple(b), col, 3)
     for x, y, st, tid in scn.dots.get(f, []):
         L, W = scn.size.get(tid, (scn.car_len, 0.55 * scn.car_len))
-        ang = np.degrees(scn.heading.get(tid, {}).get(f, 0.0))
-        rect = (tuple(to_px((x, y)).astype(float)),
-                (max(L * scale, 6), max(W * scale, 4)), ang)
+        rad = scn.heading.get(tid, {}).get(f, 0.0)
+        Lpx, Wpx = max(L * scale, 6), max(W * scale, 4)
+        rect = (tuple(to_px((x, y)).astype(float)), (Lpx, Wpx),
+                np.degrees(rad))
         box = cv2.boxPoints(rect).astype(np.int32)
-        cv2.fillConvexPoly(img, box, STATE_BGR[st])
-    # timers over stopped cars
+        col = STATE_BGR[st]
+        cv2.fillConvexPoly(img, box, col)
+        # heading triangle on the front edge (SinD style): the box's L axis
+        # points along (cos, sin)(rad), so the front edge sits at +L/2
+        u = np.array([np.cos(rad), np.sin(rad)])
+        v = np.array([-u[1], u[0]])
+        c = np.array(rect[0])
+        base = c + u * (Lpx / 2)
+        tri = np.array([base + v * Wpx * 0.42, base - v * Wpx * 0.42,
+                        base + u * max(5.0, Lpx * 0.35)], np.int32)
+        cv2.fillConvexPoly(img, tri, tuple(int(x * 0.55) for x in col))
+    # timers over stopped cars: greedily stack labels upward so packed
+    # queues don't pile every timer on the same spot
     r = max(4, int(0.35 * scn.car_len * scale))
-    for tid, waited in scn.active_waits(t):
-        for df in range(-2, 3):
-            p = self_pos(scn, tid, f + df)
-            if p is not None:
-                px = to_px(p)
-                cv2.putText(img, f"{waited:4.1f}s",
-                            (px[0] - 18, px[1] - r - 6),
-                            HUD_FONT, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+    placed = []
+    for tid, waited in sorted(scn.active_waits(t), key=lambda w: -w[1]):
+        p = next((q for df in range(-2, 3)
+                  if (q := self_pos(scn, tid, f + df)) is not None), None)
+        if p is None:
+            continue
+        px = to_px(p)
+        txt = f"{waited:4.1f}s"
+        (tw, th), _ = cv2.getTextSize(txt, HUD_FONT, 0.55, 1)
+        for k in range(8):
+            org = (px[0] - 18, px[1] - r - 6 - k * (th + 6))
+            rect = (org[0] - 2, org[1] - th - 2, org[0] + tw + 2,
+                    org[1] + 4)
+            if not any(rect[0] < q[2] and rect[2] > q[0] and
+                       rect[1] < q[3] and rect[3] > q[1] for q in placed):
+                placed.append(rect)
+                cv2.putText(img, txt, org, HUD_FONT, 0.55,
+                            (240, 240, 240), 1, cv2.LINE_AA)
                 break
+    draw_signals(img, scn, f, to_px)
     draw_hud(img, scn, f)
     return img
+
+
+def draw_signals(img, scn, f, to_px):
+    """3-lamp signal head beside each stop bar (red top / amber / green
+    bottom); the lit lamp follows scn.signal for this frame."""
+    for ap in scn.xing["approaches"]:
+        green = scn.signal[ap["name"]][f]
+        (x1, y1), (x2, y2) = ap["out_line"]
+        mid_w = np.array([(x1 + x2) / 2, (y1 + y2) / 2])
+        mid = to_px(mid_w).astype(float)
+        d = np.array([x2 - x1, y2 - y1], float)
+        d /= np.hypot(*d) or 1e-9
+        n = np.array([-d[1], d[0]])
+        # sit on the side away from the queue polygon
+        c = np.array(ap["queue_poly"], float).mean(0)
+        if (mid_w - c) @ n < 0:
+            n = -n
+        base = mid + n * 34
+        wpx, hpx = 16, 40
+        tl = (int(base[0] - wpx / 2), int(base[1] - hpx / 2))
+        br = (int(base[0] + wpx / 2), int(base[1] + hpx / 2))
+        cv2.rectangle(img, tl, br, (28, 28, 32), -1)
+        cv2.rectangle(img, tl, br, (90, 90, 90), 1)
+        for frac, col, lit in ((0.22, (60, 60, 230), not green),
+                               (0.50, (60, 200, 240), False),
+                               (0.78, (80, 220, 80), green)):
+            p = (int(base[0]), int(tl[1] + frac * hpx))
+            cv2.circle(img, p, 5, col if lit else (48, 48, 52), -1)
 
 
 def self_pos(scn, tid, f):

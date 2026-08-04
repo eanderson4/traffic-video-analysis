@@ -28,6 +28,16 @@ M/D/1 mean queue Lq=rho^2/(2(1-rho)) and M/M/1 Lq=rho^2/(1-rho) against the
 measured mean queue. Undersaturated only — rho>=1 means the deterministic
 models diverge and we say so instead of printing a silly number.
 
+Movements: each track is classified left/straight/right/uturn by pairing its
+entry (first in_line crossing, travel direction) with its exit (first
+subsequent out_line crossing of any approach AGAINST that approach's travel
+direction = leaving the junction). The exit heading is -dir of the exit
+approach; the turn angle between entry and exit headings gives the label
+(image coords are y-down, so a positive z cross product is a right turn).
+Per-movement arrival counts/lambdas and queued-wait splits land in each
+approach's "movements" dict. Cars already inside the view at clip start
+never cross an in_line — they are labeled from their exit crossing alone.
+
 Outputs: queue.json + qa/xing-annotation.png (lines/polys over frame 0 with
 all tracks) + qa/xing-<name>.png (Newell cumulative curves + queue timeline).
 """
@@ -40,6 +50,7 @@ import numpy as np
 
 REFRACTORY_S = 2.0      # one crossing event per track per line within this
 MIN_DEPARTURES_FOR_MU = 3
+MOVEMENTS = ("left", "straight", "right", "uturn", "unknown")
 
 
 def _signed_dist(pts, p0, n):
@@ -117,7 +128,73 @@ def wait_runs(frames, queued, fps):
     return out
 
 
-def analyze_approach(ap, tracks, n_frames, fps):
+def movement_label(entry_dir, exit_dir):
+    """Turn label from entry vs exit heading. y-down image coords: a
+    positive z cross product is a RIGHT turn."""
+    a = np.asarray(entry_dir, float)
+    b = np.asarray(exit_dir, float)
+    a /= np.hypot(*a) or 1e-9
+    b /= np.hypot(*b) or 1e-9
+    cross = a[0] * b[1] - a[1] * b[0]
+    ang = math.degrees(math.atan2(cross, a @ b))
+    if abs(ang) <= 45:
+        return "straight"
+    if abs(ang) >= 135:
+        return "uturn"
+    return "right" if ang > 0 else "left"
+
+
+def classify_movements(approaches, tracks, fps):
+    """tid -> {"entry": approach idx | None, "label": movement | None,
+    "exits": [(t, approach idx)]}. Entry = first in_line crossing (travel
+    direction); exit = out_line crossing AGAINST the travel direction
+    (= leaving the junction through that approach's leg). Tracks already
+    inside the view at clip start have entry/label None but may still have
+    exits, which analyze_approach uses to label them per approach."""
+    out = {}
+    for tr in tracks:
+        ins, exits = [], []
+        for ai, ap in enumerate(approaches):
+            for t, _ in line_events(tr, *ap["in_line"], ap["dir"], fps):
+                ins.append((t, ai))
+            rev = [-ap["dir"][0], -ap["dir"][1]]
+            for t, _ in line_events(tr, *ap["out_line"], rev, fps):
+                exits.append((t, ai))
+        exits.sort()
+        entry, t_in, label = None, None, None
+        if ins:
+            t_in, entry = min(ins)
+            later = [(t, ai) for t, ai in exits if t > t_in]
+            if later:
+                _, ai_out = min(later)
+                label = movement_label(
+                    approaches[entry]["dir"],
+                    [-approaches[ai_out]["dir"][0],
+                     -approaches[ai_out]["dir"][1]])
+        out[tr["id"]] = {"entry": entry, "t": t_in, "label": label,
+                         "exits": exits}
+    return out
+
+
+def track_movement(tid, t_after, ap, approaches, moves):
+    """Movement label for a track relative to approach `ap`: from its
+    entry->exit pair if it entered via this approach, else from its first
+    exit after t_after (cars that started inside the view)."""
+    m = moves.get(tid)
+    if not m:
+        return "unknown"
+    if m["label"] is not None and approaches[m["entry"]] is ap:
+        return m["label"]
+    for t, ai in m["exits"]:
+        if t_after is None or t > t_after:
+            return movement_label(ap["dir"],
+                                  [-approaches[ai]["dir"][0],
+                                   -approaches[ai]["dir"][1]])
+    return "unknown"
+
+
+def analyze_approach(ap, tracks, n_frames, fps, moves=None,
+                     approaches=None):
     name = ap["name"]
     arrivals, departures = [], []
     q = np.zeros(n_frames, dtype=int)
@@ -162,6 +239,22 @@ def analyze_approach(ap, tracks, n_frames, fps):
                         if queued_ids else 0.0),
         "waits": [[tid, round(t0, 2), round(d, 1)] for tid, t0, d in waits],
     }
+    # movement split (left/straight/right/uturn/unknown)
+    if moves is not None:
+        mv = {m: {"n": 0, "waits": []} for m in MOVEMENTS}
+        for t, tid in arrivals:
+            mv[track_movement(tid, t, ap, approaches, moves)]["n"] += 1
+        for tid, t0, dur in waits:
+            mv[track_movement(tid, t0, ap, approaches,
+                              moves)]["waits"].append(dur)
+        res["movements"] = {
+            m: {"n_arrivals": v["n"],
+                "lambda_vph": round(v["n"] / duration * 3600, 1),
+                "n_cars_queued": len(v["waits"]),
+                "total_wait_veh_s": round(sum(v["waits"]), 1),
+                "mean_wait_s": (round(sum(v["waits"]) / len(v["waits"]), 1)
+                                if v["waits"] else 0.0)}
+            for m, v in mv.items() if v["n"] or v["waits"]}
     # queueing-theory scoreboard
     if mu and lam > 0:
         rho = lam / mu
@@ -264,7 +357,9 @@ def run(ws):
     tracks = data["tracks"]
     plot_annotation(ws, xing["approaches"], tracks)
 
-    results = [analyze_approach(ap, tracks, n_frames, fps)
+    moves = classify_movements(xing["approaches"], tracks, fps)
+    results = [analyze_approach(ap, tracks, n_frames, fps, moves,
+                                xing["approaches"])
                for ap in xing["approaches"]]
     ws.save("queue.json", {"fps": fps, "n_frames": n_frames,
                            "duration_s": round(n_frames / fps, 1),
@@ -284,5 +379,12 @@ def run(ws):
               f"{r['lambda_vph']:>8.0f} {mu:>8} {rho:>6} "
               f"{r['mean_queue']:>5} {r['max_queue']:>5} "
               f"{r['total_wait_veh_s']:>10.0f} {md1:>8}")
+        mv = r.get("movements") or {}
+        if mv:
+            bits = [f"{m[:1].upper()} {v['n_arrivals']} "
+                    f"({v['lambda_vph']:.0f}/h, wait "
+                    f"{v['total_wait_veh_s']:.0f})"
+                    for m, v in mv.items()]
+            print(f"  movements: {' | '.join(bits)}")
         out = plot_approach(ws, r, n_frames, fps)
         print(f"  QA: {out}")
