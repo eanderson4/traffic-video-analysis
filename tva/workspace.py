@@ -32,17 +32,24 @@ def init(src, work):
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
+         "-show_entries", "format=duration",
          "-of", "json", src],
         capture_output=True, text=True, check=True)
-    st = json.loads(probe.stdout)["streams"][0]
+    info = json.loads(probe.stdout)
+    st = info["streams"][0]
     num, den = st["r_frame_rate"].split("/")
+    fps = float(num) / float(den)
+    if st.get("nb_frames", "N/A") != "N/A":
+        n_frames = int(st["nb_frames"])
+    else:  # some containers (e.g. YouTube downloads) omit the frame count
+        n_frames = round(float(info["format"]["duration"]) * fps)
     ws = Workspace(work)
     os.makedirs(ws.qa, exist_ok=True)
     ws.save("meta.json", {
         "src": src,
         "width": st["width"],
         "height": st["height"],
-        "fps": float(num) / float(den),
-        "n_frames": int(st["nb_frames"]),
+        "fps": fps,
+        "n_frames": n_frames,
     })
     return ws

@@ -12,7 +12,8 @@ def main():
     p.add_argument("--work", required=True)
 
     for name in ("stabilize", "register", "world", "flow", "spacetime",
-                 "worldmap", "roads", "plate", "segment", "anchors"):
+                 "worldmap", "roads", "plate", "segment", "anchors",
+                 "queue", "xingvid"):
         p = sub.add_parser(name)
         p.add_argument("--work", required=True)
 
@@ -109,6 +110,12 @@ def main():
     elif args.cmd == "anchors":
         from . import refine
         refine.anchors(ws)
+    elif args.cmd == "queue":
+        from . import queue as queue_mod
+        queue_mod.run(ws)
+    elif args.cmd == "xingvid":
+        from . import xingvid
+        xingvid.run(ws)
     elif args.cmd == "plate":
         from . import plate
         plate.build(ws)
