@@ -148,4 +148,4 @@ Rule of thumb: Tier 0-1 makes the current homography world honest and cheap; Tie
 31. Hierarchical UAV visual geo-localization vs satellite imagery (retrieval + matching + PnP) — https://www.sciencedirect.com/science/article/pii/S0957417424029312
 32. GNSS-denied UAV geolocalization by visual map matching — https://arxiv.org/pdf/2103.14381
 
-Raw per-source extraction notes: `/home/eric/grove/traffic-video-analysis/research/notes/` (highD, CitySim, Fonod 2025).
+Raw per-source extraction notes: `research/notes/` in this repo (highD, CitySim, Fonod 2025).
