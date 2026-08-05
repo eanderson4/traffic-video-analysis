@@ -112,7 +112,7 @@ def queued_samples(tr, poly, fps):
 
 
 def wait_runs(frames, queued, fps):
-    """Contiguous queued stretches -> [(t_start, duration_s)]."""
+    """Contiguous queued stretches -> [(t_start, duration_s, end_frame)]."""
     out = []
     start = None
     prev = None
@@ -120,11 +120,11 @@ def wait_runs(frames, queued, fps):
         if q and start is None:
             start = f
         elif not q and start is not None:
-            out.append((start / fps, (prev - start + 1) / fps))
+            out.append((start / fps, (prev - start + 1) / fps, prev))
             start = None
         prev = f
     if start is not None:
-        out.append((start / fps, (prev - start + 1) / fps))
+        out.append((start / fps, (prev - start + 1) / fps, prev))
     return out
 
 
@@ -207,8 +207,11 @@ def analyze_approach(ap, tracks, n_frames, fps, moves=None,
         for f, qf in zip(frames, queued):
             if qf and f < n_frames:
                 q[f] += 1
-        for t0, dur in wait_runs(frames, queued, fps):
-            waits.append((tr["id"], t0, dur))
+        for t0, dur, f_end in wait_runs(frames, queued, fps):
+            # a run ending on the track's last frame means the car left the
+            # view (or the clip ended) while still queued, NOT that it
+            # departed — with a zooming camera this is common
+            waits.append((tr["id"], t0, dur, bool(f_end >= frames[-1])))
             queued_ids.add(tr["id"])
     arrivals.sort()
     departures.sort()
@@ -220,7 +223,7 @@ def analyze_approach(ap, tracks, n_frames, fps, moves=None,
                   if queued_mask[min(int(d[0] * fps), n_frames - 1)]]
     mu = (len(dep_during) / disch_t
           if len(dep_during) >= MIN_DEPARTURES_FOR_MU and disch_t > 0 else None)
-    total_wait = sum(d for _, _, d in waits)
+    total_wait = sum(w[2] for w in waits)
     res = {
         "name": name,
         "n_arrivals": len(arrivals),
@@ -237,14 +240,15 @@ def analyze_approach(ap, tracks, n_frames, fps, moves=None,
         "total_wait_veh_s": round(total_wait, 1),
         "mean_wait_s": (round(total_wait / len(queued_ids), 1)
                         if queued_ids else 0.0),
-        "waits": [[tid, round(t0, 2), round(d, 1)] for tid, t0, d in waits],
+        "waits": [[tid, round(t0, 2), round(d, 1), trunc]
+                  for tid, t0, d, trunc in waits],
     }
     # movement split (left/straight/right/uturn/unknown)
     if moves is not None:
         mv = {m: {"n": 0, "waits": []} for m in MOVEMENTS}
         for t, tid in arrivals:
             mv[track_movement(tid, t, ap, approaches, moves)]["n"] += 1
-        for tid, t0, dur in waits:
+        for tid, t0, dur, _trunc in waits:
             mv[track_movement(tid, t0, ap, approaches,
                               moves)]["waits"].append(dur)
         res["movements"] = {

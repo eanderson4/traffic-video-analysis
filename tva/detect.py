@@ -13,14 +13,16 @@ from collections import defaultdict
 VEHICLE_NAMES = {"car", "van", "truck", "bus", "motorcycle", "motor"}
 
 
-def run(ws, model="yolo11m.pt", imgsz=3840, conf=0.25, max_det=900):
+def run(ws, model="yolo11m.pt", imgsz=3840, conf=0.25, max_det=900,
+        names=None, out="tracks.json"):
     from ultralytics import YOLO
 
     meta = ws.meta
     yolo = YOLO(model)
-    class_ids = [i for i, n in yolo.names.items() if n in VEHICLE_NAMES]
+    names = names or VEHICLE_NAMES
+    class_ids = [i for i, n in yolo.names.items() if n in names]
     class_names = {i: yolo.names[i] for i in class_ids}
-    print(f"vehicle classes: {class_names}")
+    print(f"classes: {class_names}")
     tracks = defaultdict(lambda: {"cls": None, "obs": []})
     n = 0
     for i, r in enumerate(yolo.track(
@@ -42,7 +44,7 @@ def run(ws, model="yolo11m.pt", imgsz=3840, conf=0.25, max_det=900):
         if i % 50 == 0:
             print(f"frame {i}: {len(tracks)} tracks, {n} obs total",
                   flush=True)
-    ws.save("tracks.json", {
+    ws.save(out, {
         "model": model, "imgsz": imgsz, "conf": conf, "max_det": max_det,
         "tracks": [{"id": tid, **tr} for tid, tr in sorted(tracks.items())],
     })
