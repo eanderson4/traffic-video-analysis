@@ -384,10 +384,16 @@ def draw_frame(frame, scn, f, mix):
     return out
 
 
+def _hud_order(names):
+    """Compass approaches in fixed corner order; custom names keep their
+    config order after them."""
+    compass = [n for n in ("west", "east", "south", "north") if n in names]
+    return compass + [n for n in names if n not in compass]
+
+
 def hud_anchor(scn, name):
     """Rough center of an approach's HUD corner block (fly-to target)."""
-    order = [n for n in ("west", "east", "south", "north")
-             if n in {ap["name"] for ap in scn.counters}]
+    order = _hud_order([ap["name"] for ap in scn.counters])
     i = order.index(name)
     x = scn.w - 170 if i % 2 == 1 else 170
     y = scn.h - 45 if i >= 2 else 45
@@ -491,7 +497,7 @@ def draw_hud(img, scn, f):
               if t1 + FLY_S - 0.5 <= t <= t1 + FLY_S + 0.2}
     counts = {name: (arrived, queued, wait)
               for name, arrived, queued, wait in scn.state_counts(f)}
-    order = [n for n in ("west", "east", "south", "north") if n in counts]
+    order = _hud_order(list(counts))
     for i, name in enumerate(order):
         arrived, queued, wait = counts[name]
         txt = (f"{name}  arr {arrived}  q {queued}  "
