@@ -66,7 +66,26 @@ get right; bad geometry = zero arrivals or ghost queues. Per approach:
 - model `weights/visdrone-yolov8x.pt`, conf 0.25, max_det 900.
 - Hero work used imgsz 3840; intersection clips ran imgsz 1920 (dense
   top-down, small cars — worked well).
+- 4K footage (Songdo, Envato clips): use tiled mode —
+  `--imgsz 1920 --tiles 2x2` (each tile ≈ native scale). Tiled cars on
+  xing2: +62% observations, 2× long tracks, no seam duplicates. The tiles
+  slice the frame with 15% overlap, merge with class-aware NMS, and feed
+  one persistent ByteTracker (standalone `BYTETracker` + `Boxes` wiring).
 - Pedestrian detection: NOT good enough for shorts. We skip peds entirely.
+  Tiling makes peds WORSE at conf 0.12 (foliage FPs amplified by upscale).
+
+### Stabilization notes (learned from stabilo's design, implemented ours)
+
+- Hybrid anchoring: every frame tries direct-to-reference registration
+  first (≥60 inliers), chains adjacent-frame H only as fallback. Killed
+  chain drift: 4.6px → 0.0px over 1429 frames on xing3 (cross-validated
+  with an independent SIFT fit).
+- Forward/backward LK consistency gate before the MAGSAC fit: 4× better
+  p95 recovery error. MAGSAC vs RANSAC alone: no measurable difference.
+- CLAHE: doesn't help when corners already saturate; available, default off.
+- Self-benchmark: `python3 -m tva stabilize --work X --selftest` warps real
+  frames by known homographies + fake moving-car outliers and reports
+  recovery error — tune registration without ground truth.
 
 ### QA loop (always look, never assume)
 
@@ -143,13 +162,21 @@ Same init/stabilize/detect/world stages, then the focus-lane stack:
 - Hero wave clip: user-supplied drone footage (testdata/hero).
 - Intersection clips: xing.mp4 (tree-lined 4-way, 60 s) and xing2.mp4
   (wide 4-way, 37.5 s) — user-supplied; both 1920x1080 ~24 fps top-down.
-- SinD (testdata/datasets/sind): track CSVs + OSM maps + signal phases for
-  Tianjin/Changchun intersections — NO video, but ground-truth signal
-  timing and bbox tracks worth mining for validation.
+- hali (testdata/hali): Envato stock, Beechville NS diamond interchange,
+  4K 34 s, pan+zoom — first tiled-mode + hybrid-anchor stress test.
+- Songdo Traffic (zenodo.org/records/13828384, CC-BY-4.0): 4K 29.97fps
+  locked-off hover over 20 signalized intersections in Songdo KR, 29
+  sample clips + 80 trajectory zips (29.97 Hz ground truth + orthophotos
+  + lane segmentations). THE validation set: run pipeline, diff against
+  their trajectories.
+- SinD (testdata/datasets/sind): track CSVs + OSM maps + signal phases —
+  no video. Full release needs an .edu application email.
 - pNEUMA (testdata/datasets/pneuma): 15 GB Athens drone trajectories (CSV),
-  no video either; backlog item is running the queue analysis at scale on it.
-- Both open research datasets. For future shorts with real signal-phase
-  truth, SinD's Traffic_Lights.csv can replace our signal-change inference.
+  no video; backlog item is running the queue analysis at scale on it.
+- Envato/Pixabay/Pexels: stock aerial intersection footage; expect to dig
+  for locked-off top-down shots (stock shooters love slow pans).
+- FLUID / CitySim / TU Dresden free sets: research sets WITH raw video
+  (+ signal truth for FLUID) — not yet pulled.
 
 ## 6. Gotchas / tech debt (short version — see docs/v2-improvements.md)
 
