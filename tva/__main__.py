@@ -11,7 +11,13 @@ def main():
     p.add_argument("src")
     p.add_argument("--work", required=True)
 
-    for name in ("stabilize", "register", "world", "flow", "spacetime",
+    p = sub.add_parser("stabilize")
+    p.add_argument("--work", required=True)
+    p.add_argument("--selftest", action="store_true",
+                   help="benchmark estimators on known synthetic warps "
+                        "(no video processing, no homographies.json)")
+
+    for name in ("register", "world", "flow", "spacetime",
                  "worldmap", "roads", "plate", "segment", "anchors",
                  "queue"):
         p = sub.add_parser(name)
@@ -81,6 +87,13 @@ def main():
     p.add_argument("--max-det", type=int, default=900,
                    help="per-frame detection cap (ultralytics default 300 "
                         "saturates on dense scenes at full imgsz)")
+    p.add_argument("--tiles", default=None,
+                   help="tiled (SAHI-style) inference grid, COLSxROWS e.g. "
+                        "2x2 (default off = whole-frame)")
+    p.add_argument("--tile-overlap", type=float, default=0.15,
+                   help="fractional overlap between tiles (default 0.15)")
+    p.add_argument("--out", default="tracks.json",
+                   help="output filename inside the work dir")
 
     args = ap.parse_args()
     if args.cmd == "init":
@@ -89,8 +102,11 @@ def main():
     ws = workspace.Workspace(args.work)
     if args.cmd == "stabilize":
         from . import stabilize
-        stabilize.run(ws)
-        stabilize.qa(ws)
+        if args.selftest:
+            stabilize.selftest(ws)
+        else:
+            stabilize.run(ws)
+            stabilize.qa(ws)
     elif args.cmd == "register":
         from . import register, stabilize
         register.run(ws)
@@ -98,8 +114,9 @@ def main():
     elif args.cmd == "detect":
         from . import detect
         detect.run(ws, model=args.model, imgsz=args.imgsz, conf=args.conf,
-                   max_det=args.max_det)
-        detect.qa(ws)
+                   max_det=args.max_det, tiles=args.tiles,
+                   tile_overlap=args.tile_overlap, out=args.out)
+        detect.qa(ws, tracks=args.out)
     elif args.cmd == "world":
         from . import kinematics
         kinematics.run(ws)
