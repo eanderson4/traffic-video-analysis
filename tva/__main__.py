@@ -13,9 +13,20 @@ def main():
 
     for name in ("stabilize", "register", "world", "flow", "spacetime",
                  "worldmap", "roads", "plate", "segment", "anchors",
-                 "queue", "xingvid"):
+                 "queue"):
         p = sub.add_parser(name)
         p.add_argument("--work", required=True)
+
+    p = sub.add_parser("xingvid")
+    p.add_argument("--work", required=True)
+    p.add_argument("--rain", action="store_true",
+                   help="rain queueing-theory equations from the sky "
+                        "(Little's law, Poisson, M/M/1, Kingman...)")
+    p.add_argument("--bg-darken", type=float, default=None,
+                   help="blurred background brightness 0-1 (default 0.55; "
+                        "raise for dark/dusk footage)")
+    p.add_argument("--blur-k", type=int, default=None,
+                   help="background blur kernel, odd (default 31)")
 
     p = sub.add_parser("speedqa")
     p.add_argument("--work", required=True)
@@ -115,7 +126,8 @@ def main():
         queue_mod.run(ws)
     elif args.cmd == "xingvid":
         from . import xingvid
-        xingvid.run(ws)
+        xingvid.run(ws, rain=args.rain, bg_darken=args.bg_darken,
+                    blur_k=args.blur_k)
     elif args.cmd == "plate":
         from . import plate
         plate.build(ws)

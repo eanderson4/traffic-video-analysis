@@ -45,6 +45,29 @@ STATE_BGR = {"g": (90, 220, 90), "a": (60, 200, 240), "r": (80, 80, 240),
              "p": (70, 70, 70)}
 HUD_FONT = cv2.FONT_HERSHEY_SIMPLEX
 
+RAIN_START_S = 6.0    # first equation drops once the blur has settled
+RAIN_EVERY_S = 2.6    # spawn cadence
+RAIN_FALL_S = 1.7     # fall duration (ease-out cubic)
+RAIN_SETTLE_A = 0.55  # resting opacity — annotation stays the star
+RAIN_MAX_W = 0.42     # no equation wider than this fraction of the frame
+# (tex, target height px); Little's law is the hero: it falls LAST and
+# lands dead center as the finale
+EQUATIONS = [
+    (r"$P(N{=}k)=\frac{(\lambda t)^k e^{-\lambda t}}{k!}$", 30),
+    (r"$f(t)=\mu e^{-\mu t}$", 32),
+    (r"$\rho=\lambda/\mu$", 34),
+    (r"$L=\frac{\rho}{1-\rho}$", 32),
+    (r"$W=\frac{1}{\mu-\lambda}$", 32),
+    (r"$W_q=\frac{\lambda\,E[S^2]}{2(1-\rho)}$", 30),
+    (r"$W_q\approx\frac{\rho}{1-\rho}\,\frac{c_a^2+c_s^2}{2}\,E[S]$", 28),
+    (r"$L=\lambda W$", 84),
+]
+# landing slots as (x, y) frame fractions, in EQUATIONS order; spread to
+# the four quadrants, clear of the corner HUD blocks, Kingman (wide)
+# low-center, and Little's law last, dead center
+RAIN_SLOTS = [(0.26, 0.13), (0.74, 0.13), (0.14, 0.32), (0.86, 0.32),
+              (0.20, 0.80), (0.80, 0.80), (0.50, 0.90), (0.50, 0.50)]
+
 
 class Scene:
     """All per-frame lookups the renderer needs, precomputed once."""
@@ -258,6 +281,7 @@ class Scene:
             if any(t1 - 2.0 <= td <= t1 + 8.0
                    for td in dep_t.get((name, tid), [])):
                 self.wait_ends.append((tid, t1, name, dur))
+        self.rain = False
 
     def active_waits(self, t):
         for tid, t0, t1, name in self.waits:
@@ -354,6 +378,8 @@ def draw_frame(frame, scn, f, mix):
     draw_signals(out, scn, f, Hinv_i)
     draw_timers(out, scn, f, Hinv_i)
     draw_wait_flights(out, scn, f, Hinv_i)
+    if scn.rain:
+        draw_rain(out, scn, f)
     draw_hud(out, scn, f)
     return out
 
@@ -483,9 +509,103 @@ def draw_hud(img, scn, f):
         cv2.putText(img, txt, (x, y), HUD_FONT, fs, fg, 1, cv2.LINE_AA)
 
 
-def run(ws, out=None):
+def draw_rain(img, scn, f):
+    """Queueing-theory equations fall from the sky and settle along the
+    bottom: a visual table of contents for the models that claim to
+    explain this scene."""
+    t = f / scn.fps
+    sprites = _rain_images(scn.w)
+    for i, sprite in enumerate(sprites):
+        p = (t - (RAIN_START_S + i * RAIN_EVERY_S)) / RAIN_FALL_S
+        if p <= 0:
+            continue
+        lx, ly = RAIN_SLOTS[i]
+        lx, ly = lx * scn.w, ly * scn.h
+        angle = ((i * 37) % 17) - 8            # deterministic tilt, deg
+        if p < 1:
+            e = 1 - (1 - p) ** 3               # ease-out cubic
+            x = lx + np.sin(p * 2 * np.pi) * 34 * (1 - p)
+            y = -sprite.shape[0] + (ly + sprite.shape[0]) * e
+            alpha = min(1.0, p * 3) * 0.95
+        else:
+            settle = min(1.0, (p - 1) * RAIN_FALL_S / 0.5)
+            x, y = lx, ly
+            alpha = 0.95 + (RAIN_SETTLE_A - 0.95) * settle
+        _stamp(img, sprite, x, y, angle, alpha)
+
+
+_RAIN_CACHE = None
+
+
+def _rain_images(frame_w):
+    """Render each equation once via matplotlib mathtext -> trimmed BGRA
+    sprite scaled to its target height (and clamped to RAIN_MAX_W)."""
+    global _RAIN_CACHE
+    if _RAIN_CACHE is None:
+        _RAIN_CACHE = []
+        for tex, target_h in EQUATIONS:
+            spr = _eq_bgra(tex, target_h)
+            if spr.shape[1] > RAIN_MAX_W * frame_w:
+                s = RAIN_MAX_W * frame_w / spr.shape[1]
+                spr = cv2.resize(spr, None, fx=s, fy=s,
+                                 interpolation=cv2.INTER_AREA)
+            _RAIN_CACHE.append(spr)
+    return _RAIN_CACHE
+
+
+def _eq_bgra(tex, target_h):
+    """Render mathtext to a white-text BGRA sprite. math_to_image's
+    color/transparency handling varies by version, so render the default
+    black-on-white and convert luminance -> alpha ourselves."""
+    from io import BytesIO
+
+    from matplotlib.mathtext import math_to_image
+    buf = BytesIO()
+    math_to_image(tex, buf, dpi=300, format="png")
+    gray = cv2.imdecode(np.frombuffer(buf.getvalue(), np.uint8),
+                        cv2.IMREAD_GRAYSCALE)
+    alpha = 255 - gray                          # text darkness -> opacity
+    ys, xs = np.where(alpha > 8)
+    alpha = alpha[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    bgra = np.full((*alpha.shape, 4), 255, np.uint8)
+    bgra[:, :, 3] = alpha
+    s = target_h / bgra.shape[0]
+    return cv2.resize(bgra, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+
+
+def _stamp(img, bgra, cx, cy, angle, alpha):
+    """Alpha-blend a BGRA sprite (rotated by angle deg) centered (cx, cy)."""
+    h, w = bgra.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    nw = int(h * abs(M[0, 1]) + w * abs(M[0, 0]))
+    nh = int(h * abs(M[0, 0]) + w * abs(M[0, 1]))
+    M[0, 2] += (nw - w) / 2
+    M[1, 2] += (nh - h) / 2
+    rot = cv2.warpAffine(bgra, M, (nw, nh))
+    x0, y0 = int(round(cx - nw / 2)), int(round(cy - nh / 2))
+    sx0, sy0 = max(0, -x0), max(0, -y0)
+    dx0, dy0 = max(0, x0), max(0, y0)
+    dx1, dy1 = min(img.shape[1], x0 + nw), min(img.shape[0], y0 + nh)
+    if dx1 <= dx0 or dy1 <= dy0:
+        return
+    spr = rot[sy0:sy0 + dy1 - dy0, sx0:sx0 + dx1 - dx0]
+    a = spr[:, :, 3:4].astype(np.float32) / 255.0 * alpha
+    roi = img[dy0:dy1, dx0:dx1].astype(np.float32)
+    img[dy0:dy1, dx0:dx1] = (roi * (1 - a) +
+                             spr[:, :, :3].astype(np.float32) * a
+                             ).astype(np.uint8)
+
+
+def run(ws, out=None, rain=False, bg_darken=None, blur_k=None):
+    if bg_darken is not None:
+        global BG_DARKEN
+        BG_DARKEN = bg_darken
+    if blur_k is not None:
+        global BLUR_K
+        BLUR_K = blur_k | 1  # kernel must stay odd
     scn = Scene(ws)
-    out = out or ws.path("xing-queue.mp4")
+    scn.rain = rain
+    out = out or ws.path("xing-queue-rain.mp4" if rain else "xing-queue.mp4")
     cap = cv2.VideoCapture(scn.src)
     wr = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*"mp4v"), scn.fps,
                          (scn.w, scn.h))
