@@ -49,6 +49,7 @@ import cv2
 import numpy as np
 
 REFRACTORY_S = 2.0      # one crossing event per track per line within this
+SEG_MARGIN = 0.15       # crossing-point tolerance past segment ends (frac)
 MIN_DEPARTURES_FOR_MU = 3
 MOVEMENTS = ("left", "straight", "right", "uturn", "unknown")
 
@@ -69,16 +70,25 @@ def _line_normal(p0, p1, direction):
 
 
 def line_events(tr, p0, p1, direction, fps):
-    """(time, track_id) crossings of the line in the travel direction."""
+    """(time, track_id) crossings of the line SEGMENT in the travel
+    direction. The crossing point must land on the segment itself (small
+    margin) — otherwise any car crossing the line's infinite extension
+    anywhere in the frame registers as an event."""
     n = _line_normal(p0, p1, direction)
     t = np.asarray(tr["frames"]) / fps
     pts = np.column_stack([tr["x"], tr["y"]])
     sd = _signed_dist(pts, p0, n)
+    d = np.asarray(p1, float) - np.asarray(p0, float)
+    L2 = d @ d or 1e-9
     events = []
     last_t = -1e9
     for i in range(len(sd) - 1):
         if sd[i] < 0 <= sd[i + 1] and t[i + 1] - last_t > REFRACTORY_S:
             frac = -sd[i] / (sd[i + 1] - sd[i] or 1e-9)
+            cp = pts[i] + frac * (pts[i + 1] - pts[i])
+            u = (cp - np.asarray(p0, float)) @ d / L2
+            if not -SEG_MARGIN <= u <= 1 + SEG_MARGIN:
+                continue
             events.append((float(t[i] + frac * (t[i + 1] - t[i])), tr["id"]))
             last_t = float(t[i + 1])
     return events
@@ -147,10 +157,12 @@ def movement_label(entry_dir, exit_dir):
 def classify_movements(approaches, tracks, fps):
     """tid -> {"entry": approach idx | None, "label": movement | None,
     "exits": [(t, approach idx)]}. Entry = first in_line crossing (travel
-    direction); exit = out_line crossing AGAINST the travel direction
-    (= leaving the junction through that approach's leg). Tracks already
-    inside the view at clip start have entry/label None but may still have
-    exits, which analyze_approach uses to label them per approach."""
+    direction); label = turn from entry direction vs the track's net
+    displacement after entry; exits = out_line crossings AGAINST the
+    travel direction (leaving the junction through that leg — sparse,
+    since drawn stop bars span only the inbound lanes). Tracks already
+    inside the view at clip start have entry/label None but may still
+    have exits, which analyze_approach uses to label them per approach."""
     out = {}
     for tr in tracks:
         ins, exits = [], []
@@ -164,13 +176,16 @@ def classify_movements(approaches, tracks, fps):
         entry, t_in, label = None, None, None
         if ins:
             t_in, entry = min(ins)
-            later = [(t, ai) for t, ai in exits if t > t_in]
-            if later:
-                _, ai_out = min(later)
-                label = movement_label(
-                    approaches[entry]["dir"],
-                    [-approaches[ai_out]["dir"][0],
-                     -approaches[ai_out]["dir"][1]])
+            # label from net displacement after entry — where the car
+            # actually went. Exit-line crossings miss most real exits:
+            # the drawn stop-bar segment spans the INbound lanes, but a
+            # car leaves the junction on the OUTbound lanes beside them.
+            fr = np.asarray(tr["frames"]) / fps
+            i0 = min(int(np.searchsorted(fr, t_in)), len(fr) - 1)
+            dx = tr["x"][-1] - tr["x"][i0]
+            dy = tr["y"][-1] - tr["y"][i0]
+            if dx * dx + dy * dy > 150 ** 2:
+                label = movement_label(approaches[entry]["dir"], [dx, dy])
         out[tr["id"]] = {"entry": entry, "t": t_in, "label": label,
                          "exits": exits}
     return out

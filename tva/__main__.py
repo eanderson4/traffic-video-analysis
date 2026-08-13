@@ -33,6 +33,11 @@ def main():
                         "raise for dark/dusk footage)")
     p.add_argument("--blur-k", type=int, default=None,
                    help="background blur kernel, odd (default 31)")
+    p.add_argument("--frames", default=None,
+                   help="comma-separated frame numbers: render QA stills "
+                        "to qa/xing-fN.png instead of a full video")
+    p.add_argument("--no-lanes", action="store_true",
+                   help="hide the extracted movement-lane ribbons")
 
     p = sub.add_parser("speedqa")
     p.add_argument("--work", required=True)
@@ -143,8 +148,11 @@ def main():
         queue_mod.run(ws)
     elif args.cmd == "xingvid":
         from . import xingvid
+        frames = ([int(s) for s in args.frames.split(",") if s.strip()]
+                  if args.frames else None)
         xingvid.run(ws, rain=args.rain, bg_darken=args.bg_darken,
-                    blur_k=args.blur_k)
+                    blur_k=args.blur_k, frames=frames,
+                    lanes=not args.no_lanes)
     elif args.cmd == "plate":
         from . import plate
         plate.build(ws)

@@ -1,22 +1,26 @@
 """Queue-story video: annotated footage throughout — after a short crisp
 intro the background blurs/darkens so the annotation pops, and everything
-(rotated bboxes with heading triangles, queue lines/polys, signal heads,
-wait timers whose final seconds fly into the HUD bucket when the wait
-ends, per-approach dashboard) stays glued to the road via per-frame
+(rotated bboxes with heading triangles, movement-lane ribbons extracted
+from the tracks themselves, crossing-fitted queue lines/polys, signal
+heads, wait timers whose final seconds fly into the HUD bucket when the
+wait ends, per-approach dashboard) stays glued to the road via per-frame
 homographies, so camera zoom/drift can't shake it off.
 
 Track gaps (detection dropouts) are backfilled by interpolation up to
 GAP_FILL_S so cars don't blink in and out; state comes from the track's
-stopped runs, which already span the gaps.
+stopped runs, which already span the gaps. Headings come from the car's
+movement-lane tangent when it's on one — lanes run in the travel
+direction, so backwards boxes and tilt die at the source.
 
 Driven by the same intersection.json + queue.analyze_approach numbers as
-`tva queue`.
+`tva queue`. --frames renders picked stills to qa/ for fast overlay
+iteration instead of a full video.
 """
 
 import cv2
 import numpy as np
 
-from .queue import analyze_approach, in_poly
+from .queue import analyze_approach, classify_movements, in_poly
 from .stabilize import apply_h
 
 RAW_END_S = 4.0       # intro: crisp footage, annotation already on
@@ -37,10 +41,15 @@ AMBER_FACTOR = 2.5    # amber band top = v_move * this (~15 km/h slow-roll);
                       # the default (v_move ~ 6 km/h) reads as stopped
 SIGNAL_GAP_S = 6.0    # stop-bar crossings closer than this = one green window
 SIGNAL_TAIL_S = 2.0   # window stays green this long past the last crossing
+PATH_N = 64           # arc-length samples per movement centerline
+LANE_MIN_TRACKS = 3   # fewer member tracks than this = not a lane, skip
+LANE_ALPHA = 0.30     # movement-ribbon blend strength (subtler than lines)
+FIT_MIN_PTS = 3       # crossing cluster smaller than this: draw hand line
 BG = (18, 18, 22)
 IN_LINE = (80, 220, 80)      # BGR, greenish
 OUT_LINE = (60, 60, 230)     # reddish
 QUEUE_POLY = (200, 160, 40)
+LANE_COL = (190, 200, 205)   # movement ribbons: neutral light gray-blue
 STATE_BGR = {"g": (90, 220, 90), "a": (60, 200, 240), "r": (80, 80, 240),
              "p": (70, 70, 70)}
 HUD_FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -146,8 +155,8 @@ class Scene:
         tracks = [tr for tr in wt["tracks"] if tr["id"] not in skip]
         self.approaches = [analyze_approach(ap, tracks, self.n, self.fps)
                            for ap in self.xing["approaches"]]
-        # per-track headings, carried while stopped
-        self.heading = {}
+        # per-track raw headings from path gradients, carried while stopped
+        raw_h = {}
         for tr in tracks:
             ang = np.arctan2(np.gradient(tr["y"]), np.gradient(tr["x"]))
             filled, last = [], 0.0
@@ -155,14 +164,13 @@ class Scene:
                 if sp > self.v_stop:
                     last = float(a)
                 filled.append(last)
-            self.heading[tr["id"]] = dict(zip(tr["frames"], filled))
-        # backfilled per-frame dots: observed samples plus interpolated
-        # positions across detection dropouts <= GAP_FILL_S (the render-time
-        # persistence trick from the hero pipeline, applied to every track)
+            raw_h[tr["id"]] = dict(zip(tr["frames"], filled))
+        # pass 1: smoothed, gap-filled per-track position series (the
+        # render-time persistence trick from the hero pipeline) — cached
+        # for movement-lane extraction and reused by the dots pass
         polys = [ap["queue_poly"] for ap in self.xing["approaches"]]
         max_gap = int(GAP_FILL_S * self.fps)
-        self.dots = {}
-        self.pos = {}
+        series = {}
         for tr in tracks:
             fr = np.asarray(tr["frames"])
             full = np.arange(fr[0], fr[-1] + 1)
@@ -175,16 +183,40 @@ class Scene:
                     keep[a - fr[0]: b - fr[0] + 1] = True
             for f in fr:
                 keep[f - fr[0]] = True
+            series[tr["id"]] = (full, xi, yi, spi, keep)
+        # movement lanes: median centerline per (entry, exit) movement
+        self.move_paths, self.tid_path = _movement_paths(
+            self.xing["approaches"], tracks, series, self.fps, self.car_len)
+        # counting lines as DRAWN: refit each to its actual crossing-point
+        # cluster (the hand-authored lines still drive the counting)
+        self.fit_lines = _fitted_lines(
+            self.xing["approaches"], self.approaches, series, self.fps)
+        # pass 2: backfilled per-frame dots + headings
+        self.dots = {}
+        self.pos = {}
+        self.heading = {}
+        for tr in tracks:
+            full, xi, yi, spi, keep = series[tr["id"]]
             stopped_runs = [(a, b) for s, a, b in tr["runs"] if s]
-            h_obs = self.heading[tr["id"]]
+            h_obs = raw_h[tr["id"]]
             h_arr, last_h = [], 0.0
-            for i, f in enumerate(full):
+            for f in full:
                 if f in h_obs:
                     last_h = h_obs[f]
                 h_arr.append(last_h)
             h_arr = np.arctan2(_smooth(np.sin(h_arr), HEAD_SMOOTH_K),
                                _smooth(np.cos(h_arr), HEAD_SMOOTH_K))
+            # cars don't reverse in these scenes: flip headings pointing
+            # >90° against the track's overall travel direction — noisy
+            # low-speed path gradients otherwise read as backwards boxes
+            dx, dy = xi[-1] - xi[0], yi[-1] - yi[0]
+            if dx * dx + dy * dy > 120 ** 2:
+                flip = np.cos(h_arr - np.arctan2(dy, dx)) < 0
+                h_arr = h_arr.copy()
+                h_arr[flip] += np.pi
+            path = self.move_paths.get(self.tid_path.get(tr["id"]))
             pos_d, h_d = {}, {}
+            lock_pos, lock_h = None, 0.0
             for i, f in enumerate(full):
                 if f >= self.n:
                     break
@@ -205,17 +237,47 @@ class Scene:
                     st = "p"          # parked / never moved: not drawn
                 else:
                     st = "a" if spi[i] < self.v_move * AMBER_FACTOR else "g"
-                if queued_ap is not None:
-                    # queued cars sit in a lane: snap the heading to the
-                    # approach direction instead of trusting noisy
-                    # low-speed path gradients (kills tilt + backwards
-                    # triangles)
-                    h_d[f] = float(np.arctan2(queued_ap["dir"][1],
-                                              queued_ap["dir"][0]))
-                else:
-                    h_d[f] = float(h_arr[i])
+                # heading: the car's movement-lane tangent when it is on
+                # one (kills backwards triangles AND tilt in one stroke);
+                # else the queued snap / smoothed path gradient
+                h = None
+                if path is not None:
+                    h = _path_heading(path, x, y, 1.5 * self.car_len)
+                if h is None:
+                    if queued_ap is not None:
+                        h = float(np.arctan2(queued_ap["dir"][1],
+                                             queued_ap["dir"][0]))
+                    else:
+                        h = float(h_arr[i])
+                # stopped->moving handoff: hold the heading the car had
+                # when it stopped until it has actually displaced ~a car
+                # length — crawl-speed gradients are noise, and switching
+                # sources the instant the wheels turn reads as a flip.
+                # Past that, lane-less tracks head along the displacement
+                # from the stop point until the gradient catches up.
+                if stopped:
+                    lock_pos, lock_h = (x, y), h
+                elif lock_pos is not None:
+                    d2 = ((x - lock_pos[0]) ** 2 + (y - lock_pos[1]) ** 2)
+                    if d2 < (0.9 * self.car_len) ** 2:
+                        h = lock_h
+                    else:
+                        if path is None:
+                            h = float(np.arctan2(y - lock_pos[1],
+                                                 x - lock_pos[0]))
+                        if d2 > (2.5 * self.car_len) ** 2:
+                            lock_pos = None
+                h_d[f] = float(h)
                 self.dots.setdefault(f, []).append((x, y, st, tr["id"]))
                 pos_d[f] = (x, y)
+            # feather any remaining heading steps (lock release, lane
+            # handoffs) with a short circular smoothing pass
+            if h_d:
+                fs = sorted(h_d)
+                ha = np.array([h_d[f] for f in fs])
+                ha = np.arctan2(_smooth(np.sin(ha), HEAD_SMOOTH_K),
+                                _smooth(np.cos(ha), HEAD_SMOOTH_K))
+                h_d = dict(zip(fs, ha))
             self.pos[tr["id"]] = pos_d
             self.heading[tr["id"]] = h_d
         # wait runs with their approach; flight-worthy ends are gated below
@@ -324,6 +386,108 @@ def _smooth(a, k):
     return np.convolve(ap, np.ones(k) / k, mode="valid")
 
 
+def _movement_paths(approaches, tracks, series, fps, car_len):
+    """Median centerline per (entry, exit) movement, from member tracks'
+    smoothed paths (entry crossing -> track end) resampled to PATH_N
+    arc-length samples. Returns ({movement key: (pts, unit tangents)},
+    {tid: movement key}). Entry = in_line crossing, or the approach whose
+    queue polygon holds the track's first point (cars already inside the
+    view); exit leg = the approach whose OUTbound direction best matches
+    the track's net displacement. Paths run in the travel direction, so
+    their tangents double as ground-truth headings."""
+    moves = classify_movements(approaches, tracks, fps)
+    groups, tid_key = {}, {}
+    for tr in tracks:
+        m = moves.get(tr["id"]) or {}
+        full, xi, yi = series[tr["id"]][:3]
+        entry, t0 = m.get("entry"), m.get("t")
+        if entry is None:
+            # started inside the view: adopt the approach whose queue
+            # polygon holds the track's first point, if any
+            for ai, ap in enumerate(approaches):
+                if in_poly(ap["queue_poly"], xi[0], yi[0]):
+                    entry, t0 = ai, full[0] / fps
+                    break
+        if entry is None:
+            continue
+        i0 = 0 if t0 is None else int(np.searchsorted(full, t0 * fps))
+        xs, ys = xi[i0:], yi[i0:]
+        if len(xs) < 8:
+            continue
+        s = np.concatenate([[0], np.cumsum(np.hypot(np.diff(xs),
+                                                    np.diff(ys)))])
+        if s[-1] < car_len:
+            continue
+        q = np.linspace(0, s[-1], PATH_N)
+        path = np.column_stack([np.interp(q, s, xs), np.interp(q, s, ys)])
+        # exit leg: best match between net displacement and an outbound
+        # direction (None = the car never left — still queued at clip end)
+        dx, dy = xi[-1] - xi[i0], yi[-1] - yi[i0]
+        ai_out = None
+        if dx * dx + dy * dy > 150 ** 2:
+            net = np.array([dx, dy])
+            net /= np.hypot(*net)
+            best, ai_out = 0.6, None
+            for ai, ap in enumerate(approaches):
+                c = float(-(net @ np.array(ap["dir"], float)))
+                if c > best:
+                    best, ai_out = c, ai
+        key = (entry, ai_out)
+        groups.setdefault(key, []).append(path)
+        tid_key[tr["id"]] = key
+    paths = {}
+    for key, members in groups.items():
+        if len(members) < LANE_MIN_TRACKS:
+            continue
+        pts = np.median(np.stack(members), axis=0)
+        tx, ty = np.gradient(pts[:, 0]), np.gradient(pts[:, 1])
+        norm = np.hypot(tx, ty)
+        norm[norm == 0] = 1e-9
+        paths[key] = (pts, np.column_stack([tx / norm, ty / norm]))
+    tid_key = {tid: k for tid, k in tid_key.items() if k in paths}
+    return paths, tid_key
+
+
+def _path_heading(path, x, y, max_d):
+    """Heading from the movement centerline's tangent at the nearest
+    sample, or None when the car sits too far off its lane to trust it."""
+    pts, tan = path
+    d2 = (pts[:, 0] - x) ** 2 + (pts[:, 1] - y) ** 2
+    i = int(np.argmin(d2))
+    if d2[i] > max_d * max_d:
+        return None
+    return float(np.arctan2(tan[i, 1], tan[i, 0]))
+
+
+def _fitted_lines(approaches, results, series, fps):
+    """Per approach, refit each counting line to the cluster of its actual
+    crossing points (PCA major axis over the cluster extent, small margin).
+    Counting is untouched — this only changes how the lines are drawn."""
+    out = {}
+    for ap, res in zip(approaches, results):
+        fitted = {}
+        for key, events in (("in_line", res["arrivals"]),
+                            ("out_line", res["departures"])):
+            pts = []
+            for t, tid in events:
+                ser = series.get(tid)
+                if ser is None:
+                    continue
+                full, xi, yi = ser[0], ser[1], ser[2]
+                fr = float(np.clip(t * fps, full[0], full[-1]))
+                pts.append((float(np.interp(fr, full, xi)),
+                            float(np.interp(fr, full, yi))))
+            if len(pts) >= FIT_MIN_PTS:
+                P = np.asarray(pts)
+                c = P.mean(0)
+                _, _, vt = np.linalg.svd(P - c, full_matrices=False)
+                proj = (P - c) @ vt[0]
+                fitted[key] = [c + vt[0] * (proj.min() - 40),
+                               c + vt[0] * (proj.max() + 40)]
+        out[ap["name"]] = fitted
+    return out
+
+
 def draw_frame(frame, scn, f, mix):
     """Annotation over footage; mix=0 crisp background, mix=1 fully
     blurred/darkened."""
@@ -337,12 +501,37 @@ def draw_frame(frame, scn, f, mix):
         base = frame
     # queue lines/polys, blended into the background
     layer = base.astype(np.float32)
+    # movement lanes first (deepest annotation layer): soft ribbons with
+    # arrowheads showing where each (entry, exit) movement actually flows
+    if scn.move_paths:
+        lane = np.zeros_like(base)
+        scale = _proj_scale(Hinv_i, scn.w / 2, scn.h / 2) / 100.0
+        thick = max(2, int(scn.car_len * 0.32 * scale))
+        for pts, _tan in scn.move_paths.values():
+            p = apply_h(Hinv_i, pts).astype(np.int32)
+            cv2.polylines(lane, [p], False, LANE_COL, thick, cv2.LINE_AA)
+            for j in {len(p) // 2, len(p) - 3}:   # mid + exit arrowheads
+                u = (p[min(j + 2, len(p) - 1)] - p[max(j - 2, 0)]
+                     ).astype(float)
+                n = np.hypot(*u) or 1e-9
+                u /= n
+                v = np.array([-u[1], u[0]])
+                tip = p[j].astype(float) + u * thick * 1.2
+                tri = np.array([tip,
+                                p[j] - u * thick * 1.4 + v * thick * 1.0,
+                                p[j] - u * thick * 1.4 - v * thick * 1.0],
+                               np.int32)
+                cv2.fillConvexPoly(lane, tri, LANE_COL)
+        m = lane.any(axis=2)
+        layer[m] = ((1 - LANE_ALPHA) * layer[m] +
+                    LANE_ALPHA * lane[m].astype(np.float32))
     ann = np.zeros_like(base)
     for ap in scn.xing["approaches"]:
         poly = np.array(apply_h(Hinv_i, ap["queue_poly"]), np.int32)
         cv2.polylines(ann, [poly], True, QUEUE_POLY, 2)
+        fit = scn.fit_lines.get(ap["name"], {})
         for key, col in (("in_line", IN_LINE), ("out_line", OUT_LINE)):
-            pts = apply_h(Hinv_i, ap[key]).astype(np.int32)
+            pts = apply_h(Hinv_i, fit.get(key, ap[key])).astype(np.int32)
             cv2.line(ann, tuple(pts[0]), tuple(pts[1]), col, 3)
     m = ann.any(axis=2)
     layer[m] = 0.45 * layer[m] + 0.55 * ann[m].astype(np.float32)
@@ -438,20 +627,19 @@ def _draw_fly_text(img, txt, pos, scale, alpha):
 
 
 def draw_signals(img, scn, f, Hinv_i):
-    """3-lamp signal head beside each stop bar (red top / amber / green
-    bottom); the lit lamp follows scn.signal for this frame."""
+    """3-lamp signal head at each stop bar (red top / amber / green
+    bottom); the lit lamp follows scn.signal for this frame. Sits just
+    past the stop bar on the driver's right — where the far-side head
+    actually hangs in right-hand traffic."""
     for ap in scn.xing["approaches"]:
         green = scn.signal[ap["name"]][f]
-        (x1, y1), (x2, y2) = ap["out_line"]
-        mid = np.array([(x1 + x2) / 2, (y1 + y2) / 2])
-        d = np.array([x2 - x1, y2 - y1], float)
+        p0, p1 = (np.array(pt, float) for pt in ap["out_line"])
+        mid = (p0 + p1) / 2
+        d = np.array(ap["dir"], float)
         d /= np.hypot(*d) or 1e-9
-        n = np.array([-d[1], d[0]])
-        # sit on the side away from the queue polygon
-        c = np.array(ap["queue_poly"], float).mean(0)
-        if (mid - c) @ n < 0:
-            n = -n
-        base = apply_h(Hinv_i, [mid + n * 12.0])[0]
+        right = np.array([-d[1], d[0]])   # driver's right, y-down coords
+        end = p0 if (p0 - mid) @ right > (p1 - mid) @ right else p1
+        base = apply_h(Hinv_i, [end + d * 38.0 + right * 22.0])[0]
         wpx, hpx = 16, 40
         tl = (int(base[0] - wpx / 2), int(base[1] - hpx / 2))
         br = (int(base[0] + wpx / 2), int(base[1] + hpx / 2))
@@ -602,7 +790,8 @@ def _stamp(img, bgra, cx, cy, angle, alpha):
                              ).astype(np.uint8)
 
 
-def run(ws, out=None, rain=False, bg_darken=None, blur_k=None):
+def run(ws, out=None, rain=False, bg_darken=None, blur_k=None,
+        frames=None, lanes=True):
     if bg_darken is not None:
         global BG_DARKEN
         BG_DARKEN = bg_darken
@@ -611,24 +800,40 @@ def run(ws, out=None, rain=False, bg_darken=None, blur_k=None):
         BLUR_K = blur_k | 1  # kernel must stay odd
     scn = Scene(ws)
     scn.rain = rain
+    if not lanes:
+        scn.move_paths = {}
+    raw_end = RAW_END_S * scn.fps
+    fade_end = raw_end + FADE_S * scn.fps
+
+    def mix_at(f):
+        if f < raw_end:
+            return 0.0
+        return min(1.0, (f - raw_end) / (fade_end - raw_end))
+
+    if frames:
+        # QA stills mode: render picked frames to qa/xing-fN.png and stop —
+        # the fast iteration loop for overlay work
+        cap = cv2.VideoCapture(scn.src)
+        for f in frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, min(f, scn.n - 1))
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            path = ws.path(f"qa/xing-f{f}.png")
+            cv2.imwrite(path, draw_frame(frame, scn, f, mix_at(f)))
+            print(path)
+        cap.release()
+        return
     out = out or ws.path("xing-queue-rain.mp4" if rain else "xing-queue.mp4")
     cap = cv2.VideoCapture(scn.src)
     wr = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*"mp4v"), scn.fps,
                          (scn.w, scn.h))
-    raw_end = RAW_END_S * scn.fps
-    fade_end = raw_end + FADE_S * scn.fps
     f = 0
     while f < scn.n:
         ok, frame = cap.read()
         if not ok:
             break
-        if f < raw_end:
-            mix = 0.0
-        elif f < fade_end:
-            mix = (f - raw_end) / (fade_end - raw_end)
-        else:
-            mix = 1.0
-        wr.write(draw_frame(frame, scn, f, mix))
+        wr.write(draw_frame(frame, scn, f, mix_at(f)))
         f += 1
         if f % 200 == 0:
             print(f"frame {f}/{scn.n}")
